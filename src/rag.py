@@ -1,0 +1,1368 @@
+from __future__ import annotations
+
+import os
+import re
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Literal, Sequence
+
+from src.chunking import KnowledgeChunk
+from src.retrieval import (
+    BM25Index,
+    EmbeddingClient,
+    SearchResult,
+    VectorIndex,
+    format_result_line,
+    hybrid_search,
+    tokenize,
+)
+
+
+RetrievalMode = Literal["bm25", "vector", "hybrid"]
+
+# Фоллбэк-LLM (пожелание куратора после защиты): если основная модель OpenAI
+# недоступна (гео-блок, сбой сети, исчерпание квоты), ответ генерируется через
+# OpenAI-совместимый шлюз. Дефолты — DeepSeek через vedai.by; переопределяются
+# переменными окружения FALLBACK_BASE_URL / FALLBACK_CHAT_MODEL / FALLBACK_API_KEY.
+# Без FALLBACK_API_KEY фоллбэк выключен — поведение бота прежнее.
+FALLBACK_BASE_URL_DEFAULT = "https://vedai.by/api/v1"
+FALLBACK_CHAT_MODEL_DEFAULT = "deepseek-v3.1"
+
+# Конденсация follow-up вопросов (память диалога): «А что Есенин?» после
+# «Что пил Блок?» переписывается в самостоятельный вопрос «Что пил Есенин?»
+# ДО retrieval — иначе и поиск промахнётся (в вопросе нет ключевых слов),
+# и OOD-гард отсечёт. История хранится вызывающей стороной (ботом) и
+# передаётся в answer(history=...).
+CONDENSE_INSTRUCTION = (
+    "Ты переписываешь реплику пользователя из диалога с винным ассистентом в "
+    "самостоятельный вопрос, понятный без истории диалога.\n"
+    "Правила:\n"
+    "1. Если реплика — follow-up (ссылается на предыдущие сообщения: «а что "
+    "Есенин?», «а в Италии?», «расскажи подробнее», «а красное?»), подставь "
+    "недостающий смысл из истории и сформулируй полный вопрос.\n"
+    "2. ОБЯЗАТЕЛЬНО замени местоимения и отсылки («это вино», «его», «её», "
+    "«там», «оно», «этот сорт», «этот регион») на конкретные названия из "
+    "истории. Пример: после разговора о Vin de Constance реплика «кто ещё "
+    "любил это вино?» -> «Кто ещё любил вино Vin de Constance?». Вопрос с "
+    "нераскрытой отсылкой НЕ самостоятелен.\n"
+    "3. Если реплика уже самостоятельна (не содержит отсылок к истории), "
+    "верни её ДОСЛОВНО без изменений.\n"
+    "4. Не отвечай на вопрос, не добавляй ничего от себя, не меняй язык. "
+    "Верни только текст вопроса, без кавычек и пояснений."
+)
+
+# Сколько последних пар вопрос-ответ хранить и передавать в конденсацию.
+DIALOG_HISTORY_TURNS = 5
+
+
+SYSTEM_INSTRUCTION = (
+    "Ты профессиональный эксперт-сомелье и аналитик по виноделию всего мира.\n"
+    "Отвечай строго по предоставленным выдержкам из базы знаний. Не используй "
+    "общие знания и не добавляй факты, которых нет в контексте.\n"
+    "Вопросы пользователей могут содержать опечатки и искажённые названия "
+    "('Лон периньон' вместо Dom Pérignon, 'кабирне' вместо Каберне) — распознай "
+    "искажённое название по смыслу, отвечай по восстановленной сущности и мягко "
+    "укажи корректную форму. Отказывай только если сущность не восстанавливается.\n\n"
+    "Правила ответа:\n"
+    "1. Используй только явно подтвержденные факты из релевантных фрагментов.\n"
+    "2. Если контекст частичный, дай частичный ответ и коротко укажи, чего не хватает. "
+    "Не говори 'в базе знаний нет информации', если в контексте есть хотя бы частично "
+    "релевантные сведения. Если в контексте есть конкретные факты по сути вопроса — "
+    "числовой объём производства; важные оговорки или примечания к цифре (например, что "
+    "объём завышен из-за импортного сусла/виноматериалов или искажён долей столового "
+    "винограда и продукции вроде писко); название ключевого производителя продукта — "
+    "обязательно приведи их, даже если формулировка вопроса прямо на них не наводит. "
+    "Не ограничивайся одним общим фактом, когда в контексте есть относящиеся к вопросу "
+    "подробности. Это правило распространяется и на оценочные вопросы-советы о вине "
+    "('стоит ли покупать X', 'какое вино лучше', 'что выбрать'): не отказывай, если в "
+    "контексте есть смежные принципы, помогающие принять решение (фактор винтажа, роль "
+    "производителя, условия хранения, потенциал выдержки, гастрономические принципы). "
+    "Честно скажи, что прямого ответа в материалах нет, затем изложи применимые к "
+    "вопросу принципы из контекста и укажи, какой информации не хватает для решения. "
+    "Сам факт цены или личный выбор не оценивай и не выдумывай рыночных данных.\n"
+    "3. Если релевантных сведений нет совсем, ответь: 'По этому вопросу нет "
+    "релевантной информации в предоставленных материалах'.\n"
+    "4. Игнорируй нерелевантные фрагменты, даже если в них есть похожие слова. "
+    "Не переноси сведения между странами, регионами и стилями без прямой опоры в контексте. "
+    "ВАЖНО про географию базы: Средняя Азия (Казахстан, Узбекистан, Киргизия, Таджикистан, "
+    "Туркменистан) и Закавказье (Грузия, Армения, Азербайджан), а также азиатская часть России "
+    "относятся к разделу 'Россия и постсоветское пространство', а НЕ к 'Азии'. На вопрос про "
+    "'Азию' или 'азиатские страны' вообще НЕ упоминай эти страны — ни в списке, ни в пояснениях "
+    "или оговорках; отвечай так, как будто фрагментов про Среднюю Азию и Закавказье нет в "
+    "контексте. Бери только собственно азиатские страны (Китай, Япония, Индия, Таиланд, Турция, "
+    "Израиль, Ливан и т.п.). Если пользователь прямо спрашивает о принадлежности региона "
+    "(например, 'Грузия — это Азия?'), поясни, что это группировка справочника по винодельческим "
+    "традициям, а не утверждение о географии: географически регион может относиться к Азии, но в "
+    "винной классификации рассматривается отдельно. Основания разные: Закавказье — древний винный "
+    "регион с непрерывной собственной традицией (прежде всего Грузия и Армения); виноделие Средней "
+    "Азии сложилось в основном как часть единой советской отраслевой политики (собственной винной "
+    "традиции регион почти не имел), поэтому группируется с постсоветским пространством.\n"
+    "5. Для вопросов на перечисление ('какие', 'где', 'перечисли') собери все явные "
+    "страны, регионы, сорта или стили из контекста и не объединяй их так, чтобы часть "
+    "элементов исчезла из ответа. Если перечисляешь регионы или объекты, взятые из "
+    "таблицы или списка, где они сгруппированы по странам, — всегда указывай страну "
+    "для каждого (формат 'Страна — регионы'); не выдавай регионы разных стран одним "
+    "плоским списком без привязки к странам.\n"
+    "6. Для гастрономических вопросов извлекай пары в логике 'регион/стиль/сорт -> блюда' "
+    "и используй только пары из подходящей страны или региона.\n"
+    "7. Для вопросов о статистике указывай год, единицы измерения и источник, если они "
+    "есть в контексте. Для малых объемов меньше 1 млн гл не используй десятичные "
+    "доли млн гл вроде '0.002 млн гл'; пиши удобную форму в тыс. гл, например "
+    "'около 2 тыс. гл'. Если значение помечено как оценка или ориентировочное, "
+    "используй диапазон как достаточный ответ и не добавляй оговорку о нехватке "
+    "данных о годе, если пользователь прямо не спрашивает точный год или методику. "
+    "НЕ пересчитывай единицы объёма самостоятельно (литры в гектолитры, гектолитры "
+    "в млн гл и т.п.) — приводи значения в тех единицах и с теми пересчётами, "
+    "которые уже даны в контексте. "
+    "Если рядом с приведённой цифрой в контексте есть примечание о том, что она "
+    "искажена или нерепрезентативна (например: значительная часть объёма — вино из "
+    "импортного сусла/виноматериалов; заметная доля винограда идёт на столовый виноград, "
+    "изюм или крепкие напитки вроде писко; цифра ниже порога отчёта и взята из оценки), "
+    "приведи это примечание ВМЕСТЕ с цифрой — оно часть корректного ответа, а не опция.\n"
+    "8. Если запрос не относится к вину, виноделию, сортам, регионам, хранению, "
+    "дегустации или сочетаниям с едой, не отвечай по сути запроса. Например, "
+    "на вопросы о рецептах и технологии приготовления блюд (варка пельменей, "
+    "жарка шашлыка, приготовление супов, соусов, десертов и других блюд) дай "
+    "короткий отказ и поясни, что отвечаешь только по теме вина и виноделия. "
+    "То же касается вопросов об исторических и публичных личностях. Раздели "
+    "персон на два типа по их роли в КОНТЕКСТЕ. Тип А — фигуры виноделия: "
+    "значимость персоны в контексте связана именно с вином (винодел, основатель "
+    "хозяйства, учёный-энолог и т.п.) — отвечай на любые вопросы о такой персоне "
+    "по контексту, включая 'кто такой X' и 'расскажи про X'. Тип Б — персоны, "
+    "знаменитые вне виноделия (писатели, политики, военные, учёные, космонавты "
+    "и любые другие): запрос биографии ('кто такой X', 'расскажи про X', "
+    "правление, войны, творчество) — не по адресу, дай короткий отказ без "
+    "винных фактов; вопрос о том, чем персона примечательна ('чем известен X') "
+    "или о её связи с вином ('что пил X', 'любимое вино X') — ответь винным "
+    "фактом из контекста, если он там есть, пояснив, что отвечаешь в рамках "
+    "темы вина; если винного факта нет — короткий отказ. Если к вопросу "
+    "приложена ПОДСКАЗКА ПО ФОРМЕ ВОПРОСА, следуй ей в первую очередь.\n"
+    "Если вопрос про сочетание блюда с вином или подбор вина к еде, "
+    "отвечай только по винной и гастрономической части из контекста.\n"
+    "9. Не ссылайся в ответе на внутреннюю структуру контекста: номера фрагментов "
+    "('Фрагмент 3', 'фрагменты 1, 2, 5'), имена файлов-источников и пути разделов "
+    "пользователь не видит — такие ссылки для него бессмысленны. Излагай факты "
+    "напрямую, без указания, из какого фрагмента они взяты.\n"
+    "10. Форматируй ответ в Markdown."
+)
+
+OUT_OF_DOMAIN_ANSWER = (
+    "Я отвечаю на вопросы о вине, виноделии, сортах винограда, винных регионах, "
+    "стилях вина, хранении, дегустации и сочетаниях с едой. По этому вопросу "
+    "нет релевантной информации в предоставленных материалах."
+)
+
+DOMAIN_TERMS = (
+    "вино",
+    "вина",
+    "вину",
+    "вином",
+    "винн",
+    "винодел",
+    "винзавод",
+    "виноград",
+    "сорт",
+    "сомелье",
+    "дегустац",
+    "органолепт",
+    "терруар",
+    "апеллась",
+    "апеллясь",
+    "шато",
+    "винтаж",
+    "урожай",
+    "брож",
+    "ферментац",
+    "мацерац",
+    "танин",
+    "кислот",
+    "бокал",
+    "бутыл",
+    "пробк",
+    "этикет",
+    "игрист",
+    "шампан",
+    "портвейн",
+    "херес",
+    "мадер",
+    "мадейр",
+    "креплен",
+    "тихие",
+    "красное",
+    "белое",
+    "розовое",
+    "каберне",
+    "мерло",
+    "пино",
+    "сира",
+    "шираз",
+    "мальбек",
+    "гренаш",
+    "гарнач",
+    "темпранильо",
+    "санджовезе",
+    "шардоне",
+    "совиньон",
+    "рислинг",
+    "шенен",
+    "москато",
+    "мускат",
+    "гастроном",
+    "алкогол",
+    "водк",
+    "пив",
+    "декалит",
+    "дал",
+    "гектолитр",
+    "mhl",
+    "старый свет",
+    "старого света",
+    "новый свет",
+    "нового света",
+    "филлокс",
+    "constantia",
+    "constance",
+    "констанц",
+    "констанция",
+    "ховрен",
+    "коньяк",
+    "коньячн",
+    "бренди",
+    "дистиллят",
+    "чача",
+    "квеври",
+    "кахети",
+    "карас",       # карасы — армянские глиняные сосуды (аналог квеври)
+    "арени",       # сорт Арени Нуар + пещера Арени-1
+    "вайоц",       # Вайоц Дзор — винный регион Армении
+    "солера",
+    "амфорн",
+    "зибиббо",
+    "ботрит",
+    "эстуфаж",
+    "кизляр",
+    "долин",
+    "архадересс",
+    "арманьяк",
+    "граппа",
+    "голицын",
+    "сараджишвили",
+    "сараджев",
+    "фролов-багреев",
+    "дравиньи",
+    "егоров",
+    "дзитоев",
+    "григорьянц",
+    "седракян",
+    "перольд",
+    "катена",
+    "пуже",
+    "бурсико",
+    "ван рибек",
+    "ван дер стел",
+    "егоров",
+    "голицын",
+)
+
+BASE_COVERAGE_TERMS = (
+    "представлен",
+    "представлены",
+    "представлена",
+    "представлено",
+    "в базе",
+    "база",
+    "базе",
+    "vinoterra",
+    "винотерра",
+)
+
+PAIRING_TERMS = (
+    "сочета",
+    "подход",   # подходит / подходят / подходящее
+    "подойд",   # подойдёт / подойдут / подойдете
+    "подобрать",
+    "подать",   # что подать к ...
+    "подавать",
+    "пить",     # что пить с ...
+    "выпить",
+    "пара",
+    "пары",
+    "к столу",
+    "гастроном",
+)
+
+# Маркеры постсоветского пространства: любой из них в вопросе ОТМЕНЯЕТ
+# таксономический фильтр «Азия» (см. is_asia_taxonomy_question).
+POST_SOVIET_MARKERS = (
+    "средн",       # Средняя Азия / среднеазиатский
+    "постсовет",
+    "снг",
+    "ссср",
+    "советск",
+    "закавказ",
+    "росси",
+    "казахст",
+    "узбек",
+    "киргиз",
+    "кыргыз",
+    "таджик",
+    "туркмен",
+    "грузи",
+    "армен",
+    "азербайдж",
+    "молдов",
+    "молдав",
+    "украин",
+    "беларус",
+    "белорус",
+    "крым",
+)
+
+POST_SOVIET_SOURCE_FILE = "wine_russia_and_ussr.md"
+
+# Стоп-лист для автосписка доменных токенов из заголовков базы: служебные
+# слова структуры/навигации, которые встречаются в заголовках уровней 1-2,
+# но не являются доменными сущностями (см. build_domain_tokens_from_chunks).
+HEADING_TOKEN_STOPLIST = frozenset({
+    "база", "базе", "базы", "бывш", "бывшег", "важн", "вехи", "виды",
+    "вопрос", "где", "главн", "года", "друг", "зон", "зоны", "значен",
+    "иска", "истори", "историческ", "как", "карт", "категори", "качеств",
+    "классик", "ключев", "когд", "кратк", "крупнейш", "макроблок",
+    "макрозон", "макрорегион", "международн", "мире", "миров", "наибол",
+    "нижн", "нова", "новичк", "новый", "обзор", "обща", "общий", "объем",
+    "ориентир", "основн", "особенност", "ответ", "открыт", "оценочн",
+    "период", "потенциал", "потребител", "почем", "практическ",
+    "представленн", "принципиальн", "производител", "производств",
+    "раздел", "различи", "разниц", "руководств", "свет", "северн",
+    "систем", "состав", "специфическ", "список", "справочник", "средн",
+    "стар", "стил", "стран", "технологи", "треугольник", "турист", "цвет",
+    "част", "часть", "чем", "влиян", "выбир", "южна", "южной", "для",
+    "известн", "дыхан",
+    # Заголовки wine_persons.md («Напитки писателей и поэтов» и т.п.):
+    # категории людей и служебные слова — не винные сущности. Особо опасен
+    # «пил» (стем от «пилить»): интент напитка ловится отдельно по сырым
+    # словам (DRINK_VERB_TOKENS), в доменных токенах он открывал бы дыру.
+    "актер", "богем", "века", "велик", "звезд", "знаменитост", "ислам",
+    "какой", "киногеро", "композитор", "кто", "монарх", "монастыр",
+    "музыкант", "напитк", "напиток", "пил", "пили", "писател", "политик",
+    "поэт", "правител", "религи", "сводн", "серебрян", "таблиц",
+    "христианств", "художник", "что",
+})
+
+# Intent «известности»: «Чем известен/известна/знаменит X?» в специализированном
+# винном боте — легитимный вопрос по определению (X — вероятно, сущность базы:
+# страна, регион, аппелласьон вроде Бароло, у которого нет своего заголовка).
+# Пропускаем через гард всегда; если X не винный (Москва), отказывает LLM по
+# правилу 8 промпта — тот же трейд-офф, что «Столица Франции?».
+FAME_INTENT_TERMS = (
+    "извест",     # известен / известна / известно / известны / известность
+    "знаменит",   # знаменит / знаменита / знаменитый
+    "интерес",    # чем интересен / интересна / что интересного
+    "особенн",    # что особенного в X / чем особенна X
+    "славится",   # чем славится X
+    "славятся",
+    "что такое",  # что такое франчакорта / квеври / ассамбляж — вопрос-определение
+    "кто так",    # кто такой Голицын / кто такая мадам Клико — вопрос-персона
+    "расскажи",   # расскажи про Пушкина / про мадеру — вопрос-обзор сущности
+    "люби",       # что любил Сталин / любимое вино X — вопрос о предпочтениях
+    "отлича",     # чем отличается фино от олоросо — вопрос-сравнение сущностей
+)
+
+# Intent покупки/выбора: «Стоит ли покупать X?», «Что выбрать/посоветуешь?» —
+# в винном боте это вопрос о вине по определению (X — вероятно, винная сущность,
+# возможно с опечаткой: «Дон Пениньон» токенами не матчится ни с одним маркером).
+# Тот же трейд-офф, что FAME_INTENT_TERMS: не-винный X отсекает LLM (правило 8).
+PURCHASE_INTENT_TERMS = (
+    "покупа",     # покупать / покупка / стоит ли покупать
+    "купить",
+    "куплю",
+    "приобре",    # приобрести / приобретение
+    "посовету",   # посоветуй / посоветуете
+    "советуе",    # советуешь / советуете
+    "рекоменду",  # рекомендуешь / порекомендуете
+    "подар",      # что подарить / вино в подарок
+    "выбрать",
+    "выбор",
+    "попробов",   # что попробовать в X — интент дегустации (баг: «Что
+    "пробов",     # попробовать в Словении?» отклонялся — Словения есть в базе,
+                  # но только в теле текста, не в заголовках → нет в domain_tokens)
+)
+
+# Глагол «пить» в прошедшем/настоящем — интент напитка («Что пил Наполеон?»).
+# Матчится ПОТОКЕННО (не подстрочно): иначе «пил» ловится внутри «пилить дрова».
+DRINK_VERB_TOKENS = frozenset({"пил", "пила", "пили", "пило", "пьет", "пьют", "пью", "пьем"})
+
+
+def build_domain_tokens_from_chunks(chunks: Sequence[KnowledgeChunk]) -> frozenset[str]:
+    """Автосписок доменных токенов из заголовков базы.
+
+    Логика: пользователь в интерфейсе винного бота спрашивает «Чем известна
+    Болгария?» — раз Болгария есть в базе, это винный intent по определению.
+    Ручной whitelist имён показал себя как whack-a-mole (Кизляр, Солнечная
+    долина, квеври, карасы...). Список строится при старте из чанков — новые
+    страны/регионы попадают в гард автоматически, в код не вносится ни одного
+    имени. Два источника:
+
+    1. Заголовки уровней 1-2 (# Континент / ## Страна/Регион) — целиком:
+       почти чистая география базы.
+    2. Заголовки уровней 3+ ТОЛЬКО по конвенции «Имя (Latin ...)» —
+       винодельческие провинции и сорта («Пьемонт (Piemonte)», «Прованс
+       (Provence)», «Неббиоло (Nebbiolo)»); токены берём из кириллической
+       части до скобки. Сплошной уровень 3 НЕ берём: там много общих слов
+       («интересн», «сравнен», «термин»), гард стал бы дырявым.
+    3. Имена в «ёлочках» внутри заголовков уровней 3+ — именованные сущности
+       базы (производители: АО «Прасковейское», «Фанагория», «Цимлянские
+       вина»...). Вопрос «Расскажи про АО «Прасковейское»?» — винный intent
+       по определению, раз производитель есть в базе. НЕ берём кавычки из
+       заголовков-рубрик с двоеточием ДО кавычки («История: От двора до
+       «войны баролистов»», «Терруар: «Хересный треугольник»») — там
+       метафоры, чьи токены (войн, революци, остров...) делают гард дырявым.
+    """
+    lat_convention = re.compile(r"^[А-ЯЁ][^(]*\([A-Za-zÀ-ÿ]")
+    quoted_name = re.compile(r"«([^»]+)»")
+    headings: set[str] = set()
+    for chunk in chunks:
+        parts = chunk.section_path.split(" > ")
+        headings.update(parts[:2])
+        for part in parts[2:]:
+            if lat_convention.match(part):
+                # только русская часть до скобки: «Пьемонт (Piemonte)» -> «Пьемонт»
+                headings.add(part.split("(")[0])
+            if ":" not in part.split("«", 1)[0]:
+                headings.update(quoted_name.findall(part))
+    tokens: set[str] = set()
+    for heading in headings:
+        for token in tokenize(heading):
+            if len(token) >= 3 and not token.isdigit():
+                tokens.add(token)
+    return frozenset(tokens - HEADING_TOKEN_STOPLIST)
+
+
+@dataclass(frozen=True)
+class RAGAnswer:
+    question: str
+    answer: str
+    context: str
+    results: list[SearchResult]
+    mode: RetrievalMode
+    # Диагностика веток деградации (для лога/статистики): какая LLM ответила
+    # ("main" | "fallback") и каким режимом реально шёл поиск (при недоступности
+    # эмбеддингов hybrid деградирует до bm25 — см. answer()).
+    llm_branch: str = "main"
+    retrieval_mode_used: RetrievalMode | None = None
+
+    @property
+    def source_lines(self) -> list[str]:
+        return [format_result_line(result) for result in self.results]
+
+
+class WineRAGAssistant:
+    def __init__(
+        self,
+        *,
+        bm25_index: BM25Index,
+        vector_index: VectorIndex | None = None,
+        embedding_client: EmbeddingClient | None = None,
+        chat_client: object | None = None,
+        chat_model: str = "gpt-4o-mini",
+        temperature: float = 0.0,
+        timeout: float = 30.0,
+        max_answer_tokens: int = 1000,
+    ) -> None:
+        self.bm25_index = bm25_index
+        self.vector_index = vector_index
+        self.embedding_client = embedding_client
+        self.chat_client = chat_client
+        self._fallback_client: object | None = None
+        self.chat_model = chat_model
+        self.temperature = temperature
+        self.timeout = timeout
+        # Страховочный потолок длины ответа: p95 финального прогона ~640 токенов,
+        # максимум ~950 — лимит 1000 не режет нормальные ответы, только аномалии.
+        self.max_answer_tokens = max_answer_tokens
+        self._chunks_by_section: dict[tuple[str, int], list[KnowledgeChunk]] = defaultdict(list)
+        for chunk in self.bm25_index.chunks:
+            self._chunks_by_section[(chunk.source_file, chunk.section_index)].append(chunk)
+        for section_chunks in self._chunks_by_section.values():
+            section_chunks.sort(key=lambda chunk: chunk.chunk_index)
+        # Автосписок географии/сущностей базы для OOD-гарда (см.
+        # build_domain_tokens_from_chunks): «Чем известна Армения?» — винный
+        # intent, раз Армения есть в базе.
+        self.domain_tokens = build_domain_tokens_from_chunks(self.bm25_index.chunks)
+
+    def retrieve(
+        self,
+        question: str,
+        *,
+        mode: RetrievalMode = "hybrid",
+        top_k: int = 8,
+        candidate_k: int = 24,
+    ) -> list[SearchResult]:
+        if mode == "bm25":
+            return self.bm25_index.search(question, top_k=top_k)
+
+        if self.vector_index is None or self.embedding_client is None:
+            raise RuntimeError("Vector retrieval requires vector_index and embedding_client")
+
+        if mode == "vector":
+            return self.vector_index.search(question, self.embedding_client, top_k=top_k)
+
+        if mode == "hybrid":
+            return hybrid_search(
+                query=question,
+                bm25_index=self.bm25_index,
+                vector_index=self.vector_index,
+                embedding_client=self.embedding_client,
+                top_k=top_k,
+                candidate_k=candidate_k,
+            )
+
+        raise ValueError(f"Unknown retrieval mode: {mode}")
+
+    def filter_results_by_scope(
+        self,
+        question: str,
+        results: Sequence[SearchResult],
+    ) -> list[SearchResult]:
+        # ВНИМАНИЕ: не используется в прод-пути answer() (снят как переобученный
+        # scope-рулбук). Оставлено только для ablation-эксперимента hybrid vs
+        # hybrid_scoped. Не удалять.
+        allowed_markers = infer_scope_markers(question)
+        if not allowed_markers:
+            return list(results)
+
+        filtered = [
+            result
+            for result in results
+            if result_matches_scope(result, allowed_markers)
+        ]
+        filtered = self.supplement_results_by_scope(question, filtered, allowed_markers)
+        if not filtered:
+            fallback_query = f"{question} {' '.join(allowed_markers)}"
+            fallback_results = self.bm25_index.search(
+                fallback_query,
+                top_k=max(40, len(results) * 5, 8),
+            )
+            filtered = [
+                result
+                for result in fallback_results
+                if result_matches_scope(result, allowed_markers)
+            ]
+            filtered = self.supplement_results_by_scope(question, filtered, allowed_markers)
+            if not filtered:
+                return list(results)
+
+        filtered = promote_required_scope_results(question, filtered)
+
+        if is_volume_query(question):
+            filtered = sorted(
+                filtered,
+                key=lambda result: (
+                    volume_section_priority(result.section_path),
+                    -result.score,
+                    result.rank,
+                ),
+            )
+
+        return [
+            SearchResult(
+                chunk=result.chunk,
+                score=result.score,
+                method=result.method,
+                rank=rank,
+            )
+            for rank, result in enumerate(filtered, start=1)
+        ]
+
+    def supplement_results_by_scope(
+        self,
+        question: str,
+        results: Sequence[SearchResult],
+        allowed_markers: Sequence[str],
+    ) -> list[SearchResult]:
+        required_markers = required_scope_markers(question)
+        if not required_markers:
+            return list(results)
+
+        completed = list(results)
+        present_markers = {
+            marker
+            for marker in required_markers
+            if any(result_matches_scope(result, [marker]) for result in completed)
+        }
+        missing_markers = [marker for marker in required_markers if marker not in present_markers]
+        if not missing_markers:
+            return completed
+
+        fallback_query = f"{question} {' '.join(allowed_markers)} {' '.join(missing_markers)}"
+        seen = {result.chunk.chunk_id for result in completed}
+        for result in self.bm25_index.search(fallback_query, top_k=80):
+            if result.chunk.chunk_id in seen:
+                continue
+            if result_matches_scope(result, missing_markers):
+                completed.append(result)
+                seen.add(result.chunk.chunk_id)
+                present_markers = {
+                    marker
+                    for marker in required_markers
+                    if any(result_matches_scope(candidate, [marker]) for candidate in completed)
+                }
+                missing_markers = [
+                    marker for marker in required_markers if marker not in present_markers
+                ]
+                if not missing_markers:
+                    break
+        return completed
+
+    def expand_results_by_section(
+        self,
+        results: Sequence[SearchResult],
+        *,
+        max_chunks_per_section: int = 8,
+        max_sections: int | None = 4,
+        min_score_ratio: float | None = 0.85,
+        include_unexpanded_results: bool = False,
+    ) -> list[SearchResult]:
+        """Add sibling chunks from the same Markdown section to preserve lists."""
+
+        expanded: list[SearchResult] = []
+        seen_chunk_ids: set[str] = set()
+        seen_sections: set[tuple[str, int]] = set()
+        best_score = max((result.score for result in results), default=0.0)
+        expanded_section_count = 0
+
+        for result in results:
+            section_key = (result.source_file, result.chunk.section_index)
+            if section_key in seen_sections:
+                continue
+
+            can_expand = True
+            if max_sections is not None and expanded_section_count >= max_sections:
+                can_expand = False
+            if min_score_ratio is not None and best_score > 0:
+                can_expand = can_expand and result.score >= best_score * min_score_ratio
+
+            if not can_expand:
+                if include_unexpanded_results and result.chunk_id not in seen_chunk_ids:
+                    seen_chunk_ids.add(result.chunk_id)
+                    expanded.append(
+                        SearchResult(
+                            chunk=result.chunk,
+                            score=result.score,
+                            method=result.method,
+                            rank=len(expanded) + 1,
+                        )
+                    )
+                continue
+
+            seen_sections.add(section_key)
+            expanded_section_count += 1
+            section_chunks = self._chunks_by_section.get(section_key, [result.chunk])
+            selected_chunks = list(section_chunks[:max_chunks_per_section])
+            if result.chunk not in selected_chunks:
+                selected_chunks.insert(0, result.chunk)
+
+            for chunk in selected_chunks:
+                if chunk.chunk_id in seen_chunk_ids:
+                    continue
+                seen_chunk_ids.add(chunk.chunk_id)
+                expanded.append(
+                    SearchResult(
+                        chunk=chunk,
+                        score=result.score,
+                        method=result.method
+                        if chunk.chunk_id == result.chunk_id
+                        else f"{result.method}+section",
+                        rank=len(expanded) + 1,
+                    )
+                )
+
+        return expanded
+
+    def build_context(self, results: Sequence[SearchResult]) -> str:
+        return "\n\n---\n\n".join(
+            f"[Фрагмент {result.rank}]\n"
+            f"Файл-источник: {result.source_file}\n"
+            f"Раздел: {result.section_path}\n\n"
+            f"{result.chunk.text.strip()}"
+            for result in results
+        )
+
+    def build_user_prompt(self, question: str, context: str) -> str:
+        # Подсказка по форме вопроса (правило 8, тип Б): mini стабильно путает
+        # «кто такой X» (запрос биографии -> отказ) с «чем известен X» (винный
+        # факт из контекста, если есть). 14 раундов промпт-регрессии показали,
+        # что словесное правило модель применяет нестабильно — форму вопроса
+        # определяем детерминированно кодом и передаём готовый вердикт.
+        hint = ""
+        normalized = question.lower().replace("ё", "е")
+        if re.search(r"кто\s+так|кто\s+это|расскажи\s+про|расскажи\s+о", normalized):
+            hint = (
+                "\n\nПОДСКАЗКА ПО ФОРМЕ ВОПРОСА: это запрос «кто такой X / "
+                "расскажи про X». Если X — фигура виноделия по контексту (тип А), "
+                "отвечай по контексту. Если X знаменит вне виноделия (тип Б), "
+                "ответь только фразой: «Я отвечаю только на вопросы о вине и "
+                "виноделии. Биографические справки — не моя тема.» — без "
+                "биографии и без винных фактов."
+            )
+        elif re.search(r"чем\s+(известен|известна|известно|известны|знаменит)", normalized):
+            hint = (
+                "\n\nПОДСКАЗКА ПО ФОРМЕ ВОПРОСА: это вопрос «чем известен X» — "
+                "НЕ запрос биографии, отказ по мотиву «биография не моя тема» "
+                "здесь НЕПРИМЕНИМ. Если X — персона и в контексте есть винный "
+                "факт о ней, ответь этим винным фактом (без биографии из общих "
+                "знаний), пояснив, что отвечаешь в рамках темы вина. Если X — "
+                "страна, регион или винная сущность, отвечай по контексту как "
+                "обычно. Отказывай только если в контексте нет ничего "
+                "релевантного про X."
+            )
+        return (
+            "РЕЛЕВАНТНЫЕ ВЫДЕРЖКИ ИЗ БАЗЫ ЗНАНИЙ:\n"
+            f"{context}\n\n"
+            "ВОПРОС ПОЛЬЗОВАТЕЛЯ:\n"
+            f"{question}{hint}"
+        )
+
+    def answer(
+        self,
+        question: str,
+        *,
+        mode: RetrievalMode = "hybrid",
+        top_k: int = 8,
+        candidate_k: int = 24,
+        history: Sequence[tuple[str, str]] | None = None,
+    ) -> RAGAnswer:
+        # Память диалога: follow-up переписывается в самостоятельный вопрос
+        # ДО гарда и retrieval (см. CONDENSE_INSTRUCTION). При сбое конденсации
+        # работаем с исходным вопросом — деградация до прежнего поведения.
+        if history:
+            question = self.condense_question(question, history)
+        # Гард OOD: жёсткий отказ — только для ПЕРВОЙ реплики. Внутри диалога
+        # эллиптический follow-up («А Черчилль?») не несёт доменных маркеров,
+        # а при сбое конденсации доходит до гарда как есть — отказывать нельзя:
+        # пользователь уже в винном контексте. Не-винный вопрос отсечёт LLM
+        # по правилу 8 системного промпта.
+        if not history and is_out_of_domain_question(question, self.domain_tokens):
+            return RAGAnswer(
+                question=question,
+                answer=OUT_OF_DOMAIN_ANSWER,
+                context="",
+                results=[],
+                mode=mode,
+            )
+
+        # Деградация поиска (пожелание куратора после защиты): hybrid требует
+        # эмбеддинг запроса через OpenAI — при гео-блоке/сбое падал бы весь ответ,
+        # хотя BM25-индекс локальный и работает офлайн. Ловим сбой эмбеддингов и
+        # повторяем поиск чистым BM25; реальный режим фиксируем в retrieval_mode_used.
+        mode_used: RetrievalMode = mode
+        try:
+            results = self.retrieve(question, mode=mode, top_k=top_k, candidate_k=candidate_k)
+        except Exception as exc:
+            if mode == "bm25":
+                raise
+            print(f"Retrieval degradation: {mode} failed ({exc}), falling back to bm25", flush=True)
+            mode_used = "bm25"
+            results = self.retrieve(question, mode="bm25", top_k=top_k, candidate_k=candidate_k)
+        # Таксономический роутинг (НЕ scope-рулбук, см. is_asia_taxonomy_question):
+        # вопрос про Азию → постсоветский файл по структуре базы не относится к
+        # разделу «Азия»; отсеиваем ДО section expansion и LLM. Любой постсоветский
+        # маркер в вопросе выключает фильтр.
+        if is_asia_taxonomy_question(question):
+            results = [r for r in results if r.source_file != POST_SOVIET_SOURCE_FILE]
+        # scope-рулбук (filter_results_by_scope/infer_scope_markers) НАМЕРЕННО не
+        # вызывается в прод-пути: эксперимент generalization показал, что ручные
+        # scope-правила переобучены на заученные вопросы. Section expansion остаётся
+        # (сохраняет списки/таблицы раздела). Сами scope-методы не удалены — их
+        # использует ablation-эксперимент.
+        # include_unexpanded_results=True: section expansion добавляет соседние
+        # чанки раздела, но НЕ выбрасывает извлечённые результаты. Без этого флага
+        # min_score_ratio отсекал retrieved-чанки ниже 0.85*best из КОНТЕКСТА, а не
+        # только из расширения. На RRF-скорах чанк, найденный и bm25, и vector,
+        # получает ~2x скор одиночного — и один доминирующий раздел вытеснял из
+        # контекста реально релевантные top-k чанки (баг 17b: Григорьянц на hybrid
+        # rank 2 не доходил до LLM, контекст забивала секция «Бывшая Югославия»).
+        context_results = self.expand_results_by_section(
+            results, include_unexpanded_results=True
+        )
+        context = self.build_context(context_results)
+        if not results:
+            return RAGAnswer(
+                question=question,
+                answer="По этому вопросу нет релевантной информации в предоставленных материалах.",
+                context=context,
+                results=context_results,
+                mode=mode,
+                retrieval_mode_used=mode_used,
+            )
+
+        answer_text, llm_branch = self._generate_answer(question, context)
+        return RAGAnswer(
+            question=question,
+            answer=answer_text.strip(),
+            context=context,
+            results=context_results,
+            mode=mode,
+            llm_branch=llm_branch,
+            retrieval_mode_used=mode_used,
+        )
+
+    def condense_question(
+        self,
+        question: str,
+        history: Sequence[tuple[str, str]],
+    ) -> str:
+        """Переписывает follow-up в самостоятельный вопрос по истории диалога.
+
+        Дешёвый LLM-вызов (история + короткий ответ). Fail-open: любая ошибка
+        возвращает исходный вопрос — бот продолжает работать без памяти, как
+        раньше. Ответы в истории обрезаются: для восстановления смысла хватает
+        начала, а полные ответы (до 1000 токенов) раздували бы каждый запрос.
+        При сбое основной модели пробуем фоллбэк-LLM (как в _generate_answer):
+        без этого при гео-блоке OpenAI память отваливалась бы молча, хотя
+        генерация штатно работает через DeepSeek.
+        """
+        recent = list(history)[-DIALOG_HISTORY_TURNS:]
+        dialog_lines = []
+        for user_msg, bot_msg in recent:
+            dialog_lines.append(f"Пользователь: {user_msg}")
+            dialog_lines.append(f"Ассистент: {bot_msg[:300]}")
+        prompt = (
+            "ИСТОРИЯ ДИАЛОГА:\n" + "\n".join(dialog_lines) +
+            f"\n\nНОВАЯ РЕПЛИКА ПОЛЬЗОВАТЕЛЯ:\n{question}\n\n"
+            "Перепиши новую реплику в самостоятельный вопрос (или верни её "
+            "дословно, если она уже самостоятельна)."
+        )
+        messages = [
+            {"role": "system", "content": CONDENSE_INSTRUCTION},
+            {"role": "user", "content": prompt},
+        ]
+        condensed = ""
+        try:
+            chat_client = self._get_chat_client()
+            response = chat_client.chat.completions.create(
+                model=self.chat_model,
+                messages=messages,
+                temperature=0.0,
+                max_tokens=200,
+                timeout=self.timeout,
+            )
+            condensed = (response.choices[0].message.content or "").strip().strip('"')
+        except Exception as exc:
+            fallback_client = self._get_fallback_client()
+            if fallback_client is None:
+                print(f"Question condensation failed: {exc}", flush=True)
+                return question
+            fallback_model = os.environ.get("FALLBACK_CHAT_MODEL", FALLBACK_CHAT_MODEL_DEFAULT)
+            try:
+                response = fallback_client.chat.completions.create(
+                    model=fallback_model,
+                    messages=messages,
+                    temperature=0.0,
+                    max_tokens=200,
+                    timeout=self.timeout,
+                )
+                condensed = (response.choices[0].message.content or "").strip().strip('"')
+            except Exception as fallback_exc:
+                print(
+                    f"Question condensation failed on both LLMs: {exc}; {fallback_exc}",
+                    flush=True,
+                )
+                return question
+        if not condensed:
+            return question
+        if condensed != question:
+            print(f"Condensed question: {question!r} -> {condensed!r}", flush=True)
+        return condensed
+
+    def _generate_answer(self, question: str, context: str) -> tuple[str, str]:
+        """Генерация ответа: основная модель, при сбое — фоллбэк-LLM.
+
+        Возвращает (текст, ветка), ветка — "main" или "fallback". Фоллбэк активен
+        только при заданном FALLBACK_API_KEY; если и он упал — пробрасываем
+        ИСХОДНУЮ ошибку основной модели (она информативнее для диагностики).
+        """
+        messages = [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {"role": "user", "content": self.build_user_prompt(question, context)},
+        ]
+        try:
+            chat_client = self._get_chat_client()
+            response = chat_client.chat.completions.create(
+                model=self.chat_model,
+                messages=messages,
+                temperature=self.temperature,
+                max_tokens=self.max_answer_tokens,
+                timeout=self.timeout,
+            )
+            return response.choices[0].message.content or "", "main"
+        except Exception as main_exc:
+            fallback_client = self._get_fallback_client()
+            if fallback_client is None:
+                raise
+            fallback_model = os.environ.get("FALLBACK_CHAT_MODEL", FALLBACK_CHAT_MODEL_DEFAULT)
+            print(
+                f"LLM fallback: {self.chat_model} failed ({main_exc}), "
+                f"retrying with {fallback_model}",
+                flush=True,
+            )
+            try:
+                response = fallback_client.chat.completions.create(
+                    model=fallback_model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_answer_tokens,
+                    timeout=self.timeout,
+                )
+            except Exception as fallback_exc:
+                print(f"LLM fallback also failed: {fallback_exc}", flush=True)
+                raise main_exc
+            return response.choices[0].message.content or "", "fallback"
+
+    def _get_chat_client(self) -> object:
+        if self.chat_client is not None:
+            return self.chat_client
+        try:
+            from openai import OpenAI
+        except ImportError as exc:  # pragma: no cover - depends on environment.
+            raise RuntimeError("Install openai to generate RAG answers") from exc
+        client_kwargs = {}
+        base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        self.chat_client = OpenAI(**client_kwargs)
+        return self.chat_client
+
+    def _get_fallback_client(self) -> object | None:
+        """Клиент фоллбэк-LLM (DeepSeek через OpenAI-совместимый шлюз).
+
+        None, если FALLBACK_API_KEY не задан — фоллбэк отключён, поведение
+        прежнее. Клиент кешируется: создаётся при первом реальном сбое основной
+        модели, а не на старте (лишнее соединение не нужно).
+        """
+        if self._fallback_client is not None:
+            return self._fallback_client
+        api_key = os.environ.get("FALLBACK_API_KEY")
+        if not api_key:
+            return None
+        try:
+            from openai import OpenAI
+        except ImportError:  # pragma: no cover - depends on environment.
+            return None
+        self._fallback_client = OpenAI(
+            api_key=api_key,
+            base_url=os.environ.get("FALLBACK_BASE_URL", FALLBACK_BASE_URL_DEFAULT),
+        )
+        return self._fallback_client
+
+
+def is_out_of_domain_question(
+    question: str,
+    domain_tokens: frozenset[str] | None = None,
+) -> bool:
+    normalized = question.lower().replace("ё", "е")
+    if not normalized.strip():
+        return True
+
+    if any(term in normalized for term in DOMAIN_TERMS):
+        return False
+
+    if any(term in normalized for term in BASE_COVERAGE_TERMS):
+        return False
+
+    if any(term in normalized for term in PAIRING_TERMS):
+        return False
+
+    # Автосписок из заголовков базы (география/сущности): потокенный матчинг
+    # тем же tokenize, что у BM25 («Армения» -> «армени»), НЕ подстрочный —
+    # иначе «арени» ловилось бы внутри «варенье».
+    if domain_tokens:
+        question_tokens = set(tokenize(normalized))
+        if question_tokens & domain_tokens:
+            return False
+
+    # Intent «известности»/определения/предпочтения (см. FAME_INTENT_TERMS):
+    # «Чем известно Бароло?», «Что такое франчакорта?», «Что любил Сталин?» —
+    # пропускаем даже без известного маркера; не-винный X отсечёт LLM.
+    if any(term in normalized for term in FAME_INTENT_TERMS):
+        return False
+
+    # Intent покупки/выбора (см. PURCHASE_INTENT_TERMS): «Стоит ли покупать
+    # Дон Пениньон?» — опечатка не матчится токенами, пропускаем по интенту.
+    if any(term in normalized for term in PURCHASE_INTENT_TERMS):
+        return False
+
+    # «Что пил Наполеон?» — интент напитка; по СЫРЫМ словам (без стемминга):
+    # tokenize срезает «ить» и превращает «пилить» в «пил» — ложный пропуск.
+    raw_words = set(re.findall(r"[а-яеА-ЯЕ]+", normalized))
+    if raw_words & DRINK_VERB_TOKENS:
+        return False
+
+    return True
+
+
+def is_asia_taxonomy_question(question: str) -> bool:
+    """Вопрос про Азию как макрорегион базы (не про постсоветские страны).
+
+    Таксономия базы: Средняя Азия и Закавказье лежат в wine_russia_and_ussr.md
+    («Россия и постсоветское пространство»), а НЕ в разделе «Азия» wine_world.md.
+    Лексический поиск цепляет «Средняя Азия» за словоформу «Азии» и кладёт в
+    контекст Казахстан на вопрос «Где в Азии развито виноделие?» (регрессия
+    RV001) — промпт-запрет (правило 4) модель удерживает не всегда.
+
+    Это НЕ возврат scope-рулбука: правило одно, привязано к структуре базы
+    (файл = макрорегион), а не к формулировкам ожидаемых ответов, и снимается
+    ЛЮБЫМ постсоветским маркером в вопросе («Где в Средней Азии?», «Виноделие
+    Казахстана», «сравни Азию и Среднюю Азию» → фильтр выключен).
+    """
+    normalized = question.lower().replace("ё", "е")
+    if "ази" not in normalized:
+        return False
+    return not any(marker in normalized for marker in POST_SOVIET_MARKERS)
+
+
+VOLUME_QUERY_TERMS = (
+    "сколько",
+    "объем",
+    "обьем",
+    "выпуск",
+    "производ",
+    "гектолитр",
+    "масштаб",
+    "порядок",
+    "рынок",
+    "количество",
+    "оцените",
+    "ориентир",
+)
+
+
+def is_volume_query(question: str) -> bool:
+    normalized = question.lower().replace("ё", "е")
+    return any(term in normalized for term in VOLUME_QUERY_TERMS)
+
+
+GLOBAL_PRODUCTION_RANKING_TERMS = (
+    "крупней",
+    "лидер",
+    "больше всего",
+    "первом мест",
+    "первое мест",
+    "первую строч",
+    "топ",
+    "top",
+    "десятк",
+)
+
+GLOBAL_PRODUCTION_TERMS = (
+    "производ",
+    "винодельческ",
+)
+
+REGIONAL_SCOPE_TERMS = (
+    "в азии",
+    "азии",
+    "в европ",
+    "европ",
+    "в африк",
+    "африк",
+    "в северной америк",
+    "северной америк",
+    "в южной америк",
+    "южной америк",
+    "австрали",
+    "океани",
+    "снг",
+    "постсовет",
+    "бывшего ссср",
+)
+
+
+def is_global_production_ranking_query(question: str) -> bool:
+    normalized = question.lower().replace("ё", "е")
+    has_ranking = any(term in normalized for term in GLOBAL_PRODUCTION_RANKING_TERMS)
+    has_production = any(term in normalized for term in GLOBAL_PRODUCTION_TERMS)
+    has_world_scope = "мир" in normalized or "world" in normalized
+    has_country_scope = "стран" in normalized or "страна" in normalized
+    has_regional_scope = any(term in normalized for term in REGIONAL_SCOPE_TERMS)
+
+    if not has_ranking or not has_production:
+        return False
+
+    if has_world_scope:
+        return True
+
+    return has_country_scope and not has_regional_scope
+
+
+def volume_section_priority(section_path: str) -> int:
+    normalized = section_path.lower().replace("ё", "е")
+    if "крупнейшие производители вина в мире" in normalized:
+        return 0
+    if "объемы производства вина в странах бывшего ссср" in normalized:
+        return 0
+    if "объемы производства вина" in normalized:
+        return 0
+    if "объем производства" in normalized:
+        return 0
+    if "объем производства и" in normalized:
+        return 0
+    if "объемы производства" in normalized:
+        return 0
+    if "справочник объемов" in normalized:
+        return 1
+    return 2
+
+
+def infer_scope_markers(question: str) -> list[str]:
+    normalized = question.lower().replace("ё", "е")
+    if is_global_production_ranking_query(question):
+        return ["крупнейшие производители вина в мире по объему"]
+
+    if (
+        "сорт" in normalized
+        and "красн" in normalized
+        and "бел" in normalized
+    ):
+        return [
+            "красные сорта",
+            "красных сорт",
+            "белые сорта",
+            "белых сорт",
+        ]
+
+    if "сорт" in normalized and "красн" in normalized:
+        return ["красные сорта", "красных сорт"]
+    if "сорт" in normalized and "бел" in normalized:
+        return ["белые сорта", "белых сорт"]
+    if "известн" in normalized and "остров" in normalized:
+        return ["мадейра", "острова"]
+    if "мадейр" in normalized:
+        return ["мадейра", "острова"]
+    if "канар" in normalized or "азор" in normalized:
+        return ["канарские острова", "азорские острова", "острова"]
+    if "ананас" in normalized or "гавай" in normalized or "мауи" in normalized:
+        return ["гавайи", "maui", "ананасовое", "острова"]
+    if (
+        "коралл" in normalized
+        or "таити" in normalized
+        or "tahiti" in normalized
+        or "рангироа" in normalized
+    ):
+        return ["таити", "рангироа", "кораллов", "острова"]
+    if "остров" in normalized and is_volume_query(question):
+        return [
+            "оценочные объемы производства островных винодельческих зон",
+            "объеме производства вина на островах",
+            "островных регионов выпускают микрообъемы",
+        ]
+    if "остров" in normalized and (
+        "винодел" in normalized
+        or "особенн" in normalized
+        or "отлич" in normalized
+        or "специфик" in normalized
+        or "характерн" in normalized
+        or "вина" in normalized
+    ):
+        return ["особенности островного виноделия", "островное виноделие", "островные вина", "острова"]
+    if "декалит" in normalized or "дал" in normalized:
+        return ["единицы измерения объема", "декалитры", "алкоголя"]
+    if "филлокс" in normalized:
+        return ["филлоксера и ее влияние на мировое виноделие"]
+    if "голицын" in normalized:
+        return ["голицын", "новый свет", "солнечная долина", "архадерессе", "крым", "массандра"]
+    if "австрал" in normalized and "нов" in normalized and "зеланд" in normalized:
+        return ["австралия и новая зеландия", "австралия и океания", "австралия", "новая зеландия"]
+    if "северн" in normalized and "америк" in normalized:
+        return ["северная америка"]
+    if "южн" in normalized and "америк" in normalized:
+        return ["южная америка"]
+    if "бывш" in normalized and "югослав" in normalized:
+        return ["бывшая югославия"]
+    if "закавказ" in normalized:
+        return ["закавказье"]
+    if (
+        "росси" in normalized
+        or "кубан" in normalized
+        or "крым" in normalized
+        or "дагестан" in normalized
+        or "ставропол" in normalized
+        or "дон" in normalized
+        or "терек" in normalized
+    ):
+        return ["россия", "объем производства вина в россии"]
+    if "молдов" in normalized:
+        return [
+            "молдова",
+            "объемы производства вина в странах бывшего ссср",
+        ]
+    if "украин" in normalized:
+        return [
+            "украина",
+            "объемы производства вина в странах бывшего ссср",
+        ]
+    if "армен" in normalized:
+        return ["армения", "объемы производства вина в странах бывшего ссср"]
+    if "груз" in normalized:
+        return ["грузия", "объемы производства вина в странах бывшего ссср"]
+    if "азербайджан" in normalized:
+        return ["азербайджан", "объемы производства вина в странах бывшего ссср"]
+    if "узбекистан" in normalized:
+        return ["узбекистан", "объемы производства вина в странах бывшего ссср"]
+    if "ховрен" in normalized:
+        return ["ховренко", "узбекистан", "самарканд"]
+    if "егоров" in normalized:
+        return ["егоров", "массандра", "крым", "ялта"]
+    if (
+        "constantia" in normalized
+        or "constance" in normalized
+        or "констанц" in normalized
+        or ("наполеон" in normalized and "вин" in normalized)
+    ):
+        return ["constantia", "constance", "констанция", "юар", "африка"]
+    if "казахстан" in normalized:
+        return ["казахстан", "объемы производства вина в странах бывшего ссср"]
+    if "кыргыз" in normalized or "киргиз" in normalized:
+        return [
+            "кыргызстан",
+            "киргизия",
+            "объемы производства вина в странах бывшего ссср",
+        ]
+    if "таджикистан" in normalized:
+        return ["таджикистан", "объемы производства вина в странах бывшего ссср"]
+    if "туркменистан" in normalized:
+        return ["туркменистан", "объемы производства вина в странах бывшего ссср"]
+    if "франц" in normalized:
+        return ["франция"]
+    if "итал" in normalized:
+        return ["италия"]
+    if "герман" in normalized:
+        return ["германия"]
+    if "испан" in normalized:
+        return ["испания"]
+    if "сша" in normalized:
+        return ["сша", "северная америка"]
+    if "орегон" in normalized:
+        return ["орегон", "сша", "северная америка"]
+    if "канад" in normalized or "британск" in normalized or "оканаг" in normalized or "ниагар" in normalized:
+        return ["канада", "британская колумбия", "оканаган", "ниагарский полуостров"]
+    if "мексик" in normalized or ("нижн" in normalized and "калифорн" in normalized):
+        return ["мексика", "северная америка"]
+    if "австрал" in normalized and "чили" in normalized:
+        return [
+            "австралия",
+            "объем производства вина в австралии",
+            "чили",
+            "южная америка",
+            "австралия и океания",
+            "справочник объемов",
+        ]
+    if "чили" in normalized:
+        return ["чили"]
+    if "аргентин" in normalized:
+        return ["аргентина"]
+    if "уругв" in normalized:
+        return ["уругвай", "южная америка"]
+    if "бразил" in normalized:
+        return ["бразилия", "южная америка"]
+    if "перу" in normalized:
+        return ["перу", "южная америка"]
+    if "юар" in normalized:
+        return ["юар", "африка"]
+    if "южн" in normalized and "африк" in normalized:
+        return ["юар", "африка"]
+    if "алжир" in normalized:
+        return ["алжир", "африка"]
+    if "марок" in normalized:
+        return ["марокко", "африка"]
+    if "тунис" in normalized:
+        return ["тунис", "африка"]
+    if "эфиоп" in normalized:
+        return ["эфиопия", "африка"]
+    if "танзан" in normalized:
+        return ["танзания", "африка"]
+    if "африк" in normalized:
+        return ["африка"]
+    if "австрал" in normalized:
+        return ["австралия", "объем производства вина в австралии", "австралия и океания"]
+    if "нов" in normalized and "зеланд" in normalized:
+        return ["новая зеландия"]
+    if "португал" in normalized:
+        return ["португалия", "крупнейшие производители вина в мире"]
+    if "кита" in normalized or "инд" in normalized:
+        return ["азия", "китай", "индия"]
+    if "япон" in normalized:
+        return ["азия", "япония"]
+    if "таиланд" in normalized or "тайск" in normalized:
+        return ["таиланд", "объем производства вина в таиланде", "объемы производства вина в азии"]
+    if "турц" in normalized:
+        return ["азия", "турция"]
+    if "израил" in normalized:
+        return ["азия", "израиль"]
+    if "ливан" in normalized:
+        return ["азия", "ливан"]
+    if (
+        "снг" in normalized
+        or "бывш" in normalized and "ссср" in normalized
+        or "постсовет" in normalized
+    ):
+        return [
+            "виноделие россии и постсоветского пространства",
+            "европейская часть бывшего ссср",
+            "закавказье",
+            "средняя азия",
+        ]
+    if (
+        "в азии" in normalized
+        or "страны азии" in normalized
+        or "азии развито" in normalized
+    ):
+        return ["азия"]
+
+    return []
+
+
+def required_scope_markers(question: str) -> list[str]:
+    normalized = question.lower().replace("ё", "е")
+    if "австрал" in normalized and "чили" in normalized:
+        return ["объем производства вина в австралии", "чили"]
+    if (
+        "канад" in normalized
+        and ("регион" in normalized or "развит" in normalized or "где" in normalized)
+    ):
+        return ["ниагар", "оканаган"]
+    return []
+
+
+def promote_required_scope_results(
+    question: str,
+    results: Sequence[SearchResult],
+) -> list[SearchResult]:
+    required_markers = required_scope_markers(question)
+    if not required_markers or not results:
+        return list(results)
+
+    max_score = max(result.score for result in results)
+    return [
+        SearchResult(
+            chunk=result.chunk,
+            score=max_score if result_matches_scope(result, required_markers) else result.score,
+            method=result.method,
+            rank=result.rank,
+        )
+        for result in results
+    ]
+
+
+def section_matches_scope(section_path: str, allowed_markers: Sequence[str]) -> bool:
+    normalized = section_path.lower().replace("ё", "е")
+    return any(marker in normalized for marker in allowed_markers)
+
+
+def result_matches_scope(result: SearchResult, allowed_markers: Sequence[str]) -> bool:
+    normalized_section = result.section_path.lower().replace("ё", "е")
+    normalized_content = result.chunk.content.lower().replace("ё", "е")
+    return any(
+        marker in normalized_section or marker in normalized_content
+        for marker in allowed_markers
+    )

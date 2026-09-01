@@ -1,0 +1,22 @@
+# Секреты — НИКОГДА не коммитить.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Логи и БД фидбэка — создаются в рантайме.
+feedback/
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE / ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
