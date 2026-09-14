@@ -47,12 +47,109 @@ CONDENSE_INSTRUCTION = (
     "нераскрытой отсылкой НЕ самостоятелен.\n"
     "3. Если реплика уже самостоятельна (не содержит отсылок к истории), "
     "верни её ДОСЛОВНО без изменений.\n"
-    "4. Не отвечай на вопрос, не добавляй ничего от себя, не меняй язык. "
+    "4. Если пользователь исправляет ассистента ('при чём тут...', 'я спросил...', "
+    "'не это', 'только эти варианты'), не принимай названия из ошибочного ответа "
+    "за ограничения запроса. Сохрани именно намерение пользователя: например, "
+    "вопрос о сортах должен остаться вопросом о сортах, а не о странах.\n"
+    "5. Не отвечай на вопрос, не добавляй ничего от себя, не меняй язык. "
     "Верни только текст вопроса, без кавычек и пояснений."
 )
 
 # Сколько последних пар вопрос-ответ хранить и передавать в конденсацию.
 DIALOG_HISTORY_TURNS = 5
+
+# Интенты, которые делают вопрос винным даже без слова «вино».  В частности,
+# «что предложишь на десерт» — это запрос на сочетание с вином, а не вопрос о
+# приготовлении десерта.  Список намеренно содержит распространённую опечатку:
+# пользовательский текст не должен отсеиваться гардом до retrieval.
+DESSERT_TERMS = (
+    "десерт",
+    "дессерт",
+    "сладк",
+    "полуслад",
+    "полусух",
+    "шоколад",
+    "торт",
+    "пирог",
+    "пахлав",
+    "морожен",
+    "выпеч",
+    "фрукт",
+    "орех",
+)
+
+RECOMMENDATION_TERMS = (
+    "предлож",
+    "посовету",
+    "рекоменду",
+    "выбрать",
+    "что взять",
+    "что выпить",
+    "романтич",
+    "свидан",
+    "вечер",
+    "бокал",
+)
+
+VARIETY_TERMS = ("сорт", "виноград", "купаж", "ассамбляж")
+
+# Эти слова обозначают, что пользователь поправляет ассистента. В такой
+# реплике предыдущий ответ — ненадёжный источник контекста: нельзя позволять
+# конденсатору принять случайно названную страну за намерение пользователя.
+CORRECTION_TERMS = (
+    "при чем тут",
+    "причем тут",
+    "зачем тут",
+    "я спросил",
+    "я спрашивал",
+    "не про",
+    "не это",
+    "не то",
+    "только эти",
+    "кроме перечислен",
+    "как насчет",
+    "как насчёт",
+)
+
+RECIPE_TERMS = ("рецепт", "приготов", "испеч", "свар", "пожар", "как сделать")
+
+GENERIC_CONSULTATION_SOURCES = frozenset({
+    "wine_persons.md",
+    "wine_russia_and_ussr.md",
+})
+
+WORLD_GEOGRAPHY_MARKERS = (
+    "европ",
+    "ази",
+    "африк",
+    "америк",
+    "океан",
+    "австрал",
+    "новой зеланд",
+    "франц",
+    "итал",
+    "испан",
+    "португал",
+    "герман",
+    "груз",
+    "армен",
+    "казахст",
+    "кыргыз",
+    "киргиз",
+    "узбек",
+    "таджик",
+    "туркмен",
+    "молдов",
+    "украин",
+    "росси",
+    "юар",
+    "чили",
+    "аргентин",
+    "сша",
+    "кита",
+    "япон",
+    "инд",
+)
 
 
 SYSTEM_INSTRUCTION = (
@@ -139,11 +236,28 @@ SYSTEM_INSTRUCTION = (
     "приложена ПОДСКАЗКА ПО ФОРМЕ ВОПРОСА, следуй ей в первую очередь.\n"
     "Если вопрос про сочетание блюда с вином или подбор вина к еде, "
     "отвечай только по винной и гастрономической части из контекста.\n"
-    "9. Не ссылайся в ответе на внутреннюю структуру контекста: номера фрагментов "
+    "9. Ты консультант-сомелье, а не каталог с единственным правильным ответом. "
+    "Для открытого запроса 'что предложишь к десерту/на вечер' не отказывай только "
+    "потому, что в выдержках нет конкретной бутылки: предложи 2–3 уместных стиля "
+    "или категории, объясни различие и, если это помогает выбору, задай один короткий "
+    "уточняющий вопрос (какой десерт, желаемая сладость, цвет или бюджет). Если "
+    "десерт не уточнён, всё равно дай несколько вариантов, а не только вопрос. "
+    "Температуру подачи указывай, когда она подтверждена выдержками.\n"
+    "10. Не смешивай уровни классификации: полусладкое и десертное — это стили "
+    "по сладости, сорт (например, Каберне Совиньон, Пино Нуар или Саперави) — "
+    "виноград, а Франция, Грузия или Казахстан — происхождение/регион. Один сорт "
+    "может встречаться в разных странах. Если пользователь говорит 'сорт вина' "
+    "неоднозначно, мягко уточни термин и ответь по обоим возможным смыслам.\n"
+    "11. Если пользователь указывает, что предыдущий ответ ушёл не туда ('при чём тут...', "
+    "'я спрашивал...', 'не это', 'только эти варианты'), коротко извинись, признай "
+    "сбой и начни заново с последнего намерения пользователя. Не повторяй страны, "
+    "сорта или регионы, которые появились только в ошибочном ответе, и не выдавай их "
+    "за рамку вопроса.\n"
+    "12. Не ссылайся в ответе на внутреннюю структуру контекста: номера фрагментов "
     "('Фрагмент 3', 'фрагменты 1, 2, 5'), имена файлов-источников и пути разделов "
     "пользователь не видит — такие ссылки для него бессмысленны. Излагай факты "
     "напрямую, без указания, из какого фрагмента они взяты.\n"
-    "10. Форматируй ответ в Markdown."
+    "13. Форматируй ответ в Markdown."
 )
 
 OUT_OF_DOMAIN_ANSWER = (
@@ -688,7 +802,13 @@ class WineRAGAssistant:
             for result in results
         )
 
-    def build_user_prompt(self, question: str, context: str) -> str:
+    def build_user_prompt(
+        self,
+        question: str,
+        context: str,
+        *,
+        dialogue_note: str = "",
+    ) -> str:
         # Подсказка по форме вопроса (правило 8, тип Б): mini стабильно путает
         # «кто такой X» (запрос биографии -> отказ) с «чем известен X» (винный
         # факт из контекста, если есть). 14 раундов промпт-регрессии показали,
@@ -720,7 +840,7 @@ class WineRAGAssistant:
             "РЕЛЕВАНТНЫЕ ВЫДЕРЖКИ ИЗ БАЗЫ ЗНАНИЙ:\n"
             f"{context}\n\n"
             "ВОПРОС ПОЛЬЗОВАТЕЛЯ:\n"
-            f"{question}{hint}"
+            f"{question}{hint}{dialogue_note}"
         )
 
     def answer(
@@ -735,8 +855,25 @@ class WineRAGAssistant:
         # Память диалога: follow-up переписывается в самостоятельный вопрос
         # ДО гарда и retrieval (см. CONDENSE_INSTRUCTION). При сбое конденсации
         # работаем с исходным вопросом — деградация до прежнего поведения.
+        original_question = question
+        dialogue_note = ""
         if history:
-            question = self.condense_question(question, history)
+            repaired_question = repair_correction_question(question)
+            if repaired_question:
+                question = repaired_question
+                dialogue_note = (
+                    "\n\nДИАЛОГОВАЯ ПОПРАВКА: пользователь исправляет предыдущий "
+                    "ответ. Начни с короткого извинения за уход в сторону, не повторяй "
+                    "случайно названные там страны и отвечай на восстановленный вопрос."
+                )
+            else:
+                question = self.condense_question(question, history)
+                if is_correction_question(original_question):
+                    dialogue_note = (
+                        "\n\nДИАЛОГОВАЯ ПОПРАВКА: пользователь считает предыдущий ответ "
+                        "нерелевантным. Если это так, коротко извинись и следуй последней "
+                        "формулировке, не расширяя её за счёт ошибочной географии."
+                    )
         # Гард OOD: жёсткий отказ — только для ПЕРВОЙ реплики. Внутри диалога
         # эллиптический follow-up («А Черчилль?») не несёт доменных маркеров,
         # а при сбое конденсации доходит до гарда как есть — отказывать нельзя:
@@ -756,20 +893,26 @@ class WineRAGAssistant:
         # хотя BM25-индекс локальный и работает офлайн. Ловим сбой эмбеддингов и
         # повторяем поиск чистым BM25; реальный режим фиксируем в retrieval_mode_used.
         mode_used: RetrievalMode = mode
+        search_question = build_retrieval_query(question)
         try:
-            results = self.retrieve(question, mode=mode, top_k=top_k, candidate_k=candidate_k)
+            results = self.retrieve(
+                search_question, mode=mode, top_k=top_k, candidate_k=candidate_k
+            )
         except Exception as exc:
             if mode == "bm25":
                 raise
             print(f"Retrieval degradation: {mode} failed ({exc}), falling back to bm25", flush=True)
             mode_used = "bm25"
-            results = self.retrieve(question, mode="bm25", top_k=top_k, candidate_k=candidate_k)
+            results = self.retrieve(
+                search_question, mode="bm25", top_k=top_k, candidate_k=candidate_k
+            )
         # Таксономический роутинг (НЕ scope-рулбук, см. is_asia_taxonomy_question):
         # вопрос про Азию → постсоветский файл по структуре базы не относится к
         # разделу «Азия»; отсеиваем ДО section expansion и LLM. Любой постсоветский
         # маркер в вопросе выключает фильтр.
         if is_asia_taxonomy_question(question):
             results = [r for r in results if r.source_file != POST_SOVIET_SOURCE_FILE]
+        results = filter_consultation_results(question, results)
         # scope-рулбук (filter_results_by_scope/infer_scope_markers) НАМЕРЕННО не
         # вызывается в прод-пути: эксперимент generalization показал, что ручные
         # scope-правила переобучены на заученные вопросы. Section expansion остаётся
@@ -796,7 +939,9 @@ class WineRAGAssistant:
                 retrieval_mode_used=mode_used,
             )
 
-        answer_text, llm_branch = self._generate_answer(question, context)
+        answer_text, llm_branch = self._generate_answer(
+            question, context, dialogue_note=dialogue_note
+        )
         return RAGAnswer(
             question=question,
             answer=answer_text.strip(),
@@ -875,7 +1020,13 @@ class WineRAGAssistant:
             print(f"Condensed question: {question!r} -> {condensed!r}", flush=True)
         return condensed
 
-    def _generate_answer(self, question: str, context: str) -> tuple[str, str]:
+    def _generate_answer(
+        self,
+        question: str,
+        context: str,
+        *,
+        dialogue_note: str = "",
+    ) -> tuple[str, str]:
         """Генерация ответа: основная модель, при сбое — фоллбэк-LLM.
 
         Возвращает (текст, ветка), ветка — "main" или "fallback". Фоллбэк активен
@@ -884,7 +1035,12 @@ class WineRAGAssistant:
         """
         messages = [
             {"role": "system", "content": SYSTEM_INSTRUCTION},
-            {"role": "user", "content": self.build_user_prompt(question, context)},
+            {
+                "role": "user",
+                "content": self.build_user_prompt(
+                    question, context, dialogue_note=dialogue_note
+                ),
+            },
         ]
         try:
             chat_client = self._get_chat_client()
@@ -973,6 +1129,18 @@ def is_out_of_domain_question(
     if any(term in normalized for term in PAIRING_TERMS):
         return False
 
+    # Рекомендации к десерту/вечеру и вопросы о сладости — винный intent даже
+    # без слова «вино». Проверяем рецептурные формулировки отдельно, чтобы
+    # «что предложишь к десерту» не смешивалось с «что приготовить на десерт».
+    if any(term in normalized for term in RECIPE_TERMS) and not any(
+        term in normalized for term in DOMAIN_TERMS
+    ):
+        return True
+    if any(term in normalized for term in DESSERT_TERMS):
+        return False
+    if any(term in normalized for term in RECOMMENDATION_TERMS):
+        return False
+
     # Автосписок из заголовков базы (география/сущности): потокенный матчинг
     # тем же tokenize, что у BM25 («Армения» -> «армени»), НЕ подстрочный —
     # иначе «арени» ловилось бы внутри «варенье».
@@ -999,6 +1167,114 @@ def is_out_of_domain_question(
         return False
 
     return True
+
+
+def is_correction_question(question: str) -> bool:
+    """Распознаёт реплику, которая отбрасывает ошибочную ветку диалога."""
+    normalized = question.lower().replace("ё", "е")
+    return any(term in normalized for term in CORRECTION_TERMS)
+
+
+def is_broad_consultation_question(question: str) -> bool:
+    """True для общих рекомендаций без явно заданной страны/региона."""
+    normalized = question.lower().replace("ё", "е")
+    has_consultation_intent = any(
+        term in normalized for term in DESSERT_TERMS + RECOMMENDATION_TERMS
+    )
+    has_geography = any(term in normalized for term in WORLD_GEOGRAPHY_MARKERS)
+    return has_consultation_intent and not has_geography
+
+
+def build_retrieval_query(question: str) -> str:
+    """Добавляет поисковые синонимы к открытому консультационному вопросу.
+
+    Текст исходного вопроса остаётся неизменным для модели. Расширяется только
+    поисковый запрос: это помогает найти разделы «стили», «гастрономические
+    пары», «сорта» и «подача», когда пользователь говорит разговорно или с
+    опечаткой.
+    """
+    normalized = question.lower().replace("ё", "е")
+    additions: list[str] = []
+    if any(term in normalized for term in DESSERT_TERMS):
+        additions.extend(
+            [
+                "десертные вина",
+                "сладкие и полусладкие стили",
+                "гастрономические пары",
+                "шоколад фруктовые ореховые десерты",
+                "Sauternes Tokaji Muscat Port Madeira Asti",
+                "температура подачи",
+            ]
+        )
+    if any(term in normalized for term in RECOMMENDATION_TERMS):
+        additions.extend(
+            [
+                "стили вина",
+                "сорта винограда",
+                "гастрономические пары",
+                "температура подачи",
+            ]
+        )
+    if any(term in normalized for term in VARIETY_TERMS):
+        additions.extend(
+            [
+                "международные сорта винограда",
+                "регионы происхождения",
+                "Cabernet Sauvignon Merlot Saperavi Pinot Noir",
+            ]
+        )
+    if not additions:
+        return question
+    return f"{question} {' '.join(additions)}"
+
+
+def repair_correction_question(question: str) -> str | None:
+    """Возвращает безопасную формулировку для явного исправления ассистента.
+
+    LLM-конденсация полезна для обычных эллиптических follow-up, но в реплике
+    «при чём тут Казахстан, я спрашивал о сортах» она может закрепить именно
+    ошибочно названную географию. Два наиболее частых сценария восстанавливаем
+    детерминированно; остальные по-прежнему проходят через condense_question.
+    """
+    normalized = question.lower().replace("ё", "е")
+    if not is_correction_question(question):
+        return None
+
+    has_variety = any(term in normalized for term in VARIETY_TERMS)
+    has_sweetness = any(term in normalized for term in DESSERT_TERMS)
+    if has_variety and not has_sweetness:
+        return (
+            "Какие сорта винограда и стили вина можно предложить в разных "
+            "винодельческих регионах мира? Не ограничивайся странами, "
+            "которые были названы в ошибочном ответе."
+        )
+    if has_sweetness:
+        return (
+            "Какие ещё полусладкие и десертные вина можно предложить из разных "
+            "винодельческих регионов мира? Укажи стили, примеры сочетаний и "
+            "температуру подачи."
+        )
+    return None
+
+
+def filter_consultation_results(
+    question: str,
+    results: Sequence[SearchResult],
+) -> list[SearchResult]:
+    """Убирает случайные узкие разделы из общего запроса на рекомендацию.
+
+    Вопрос без страны не должен внезапно получать Казахстан, Кыргызстан или
+    биографии только потому, что слова «вечер», «женщина» или «вино» совпали с
+    такими фрагментами. Явно названную страну/регион не фильтруем.
+    """
+    if not is_broad_consultation_question(question) or not results:
+        return list(results)
+    filtered = [
+        result
+        for result in results
+        if result.source_file not in GENERIC_CONSULTATION_SOURCES
+    ]
+    return filtered or list(results)
 
 
 def is_asia_taxonomy_question(question: str) -> bool:
