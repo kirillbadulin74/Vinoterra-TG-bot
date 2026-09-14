@@ -36,6 +36,8 @@ class ConsultationIntentTests(unittest.TestCase):
 
     def test_recipe_request_is_still_out_of_domain(self):
         self.assertTrue(is_out_of_domain_question("что приготовить на десерт"))
+        self.assertTrue(is_out_of_domain_question("какие фрукты полезны"))
+        self.assertFalse(is_out_of_domain_question("какое вино подать к фруктам"))
 
     def test_open_recommendation_gets_wine_search_terms(self):
         question = "что предложишь на дессерт"

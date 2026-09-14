@@ -74,9 +74,9 @@ DESSERT_TERMS = (
     "пахлав",
     "морожен",
     "выпеч",
-    "фрукт",
-    "орех",
 )
+
+DESSERT_FOOD_TERMS = ("фрукт", "орех")
 
 RECOMMENDATION_TERMS = (
     "предлож",
@@ -1138,6 +1138,11 @@ def is_out_of_domain_question(
         return True
     if any(term in normalized for term in DESSERT_TERMS):
         return False
+    if any(term in normalized for term in DESSERT_FOOD_TERMS) and any(
+        term in normalized
+        for term in PAIRING_TERMS + RECOMMENDATION_TERMS + ("вино", "виноград")
+    ):
+        return False
     if any(term in normalized for term in RECOMMENDATION_TERMS):
         return False
 
@@ -1178,9 +1183,13 @@ def is_correction_question(question: str) -> bool:
 def is_broad_consultation_question(question: str) -> bool:
     """True для общих рекомендаций без явно заданной страны/региона."""
     normalized = question.lower().replace("ё", "е")
+    has_dessert_food = any(term in normalized for term in DESSERT_FOOD_TERMS) and any(
+        term in normalized
+        for term in PAIRING_TERMS + RECOMMENDATION_TERMS + ("вино", "виноград")
+    )
     has_consultation_intent = any(
         term in normalized for term in DESSERT_TERMS + RECOMMENDATION_TERMS
-    )
+    ) or has_dessert_food
     has_geography = any(term in normalized for term in WORLD_GEOGRAPHY_MARKERS)
     return has_consultation_intent and not has_geography
 
@@ -1195,7 +1204,11 @@ def build_retrieval_query(question: str) -> str:
     """
     normalized = question.lower().replace("ё", "е")
     additions: list[str] = []
-    if any(term in normalized for term in DESSERT_TERMS):
+    has_dessert_food = any(term in normalized for term in DESSERT_FOOD_TERMS) and any(
+        term in normalized
+        for term in PAIRING_TERMS + RECOMMENDATION_TERMS + ("вино", "виноград")
+    )
+    if any(term in normalized for term in DESSERT_TERMS) or has_dessert_food:
         additions.extend(
             [
                 "десертные вина",
