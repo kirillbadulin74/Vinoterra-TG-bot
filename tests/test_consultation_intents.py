@@ -11,6 +11,7 @@ from src.rag import (
     is_correction_question,
     is_more_examples_question,
     is_out_of_domain_question,
+    is_post_soviet_scope_question,
     repair_correction_question,
     repair_more_examples_question,
     repair_temperature_ranges,
@@ -99,6 +100,43 @@ class ConsultationIntentTests(unittest.TestCase):
         self.assertIn("Массандра", query)
         self.assertIn("кагор", query)
         self.assertNotIn("Sauternes", query)
+
+    def test_post_soviet_scope_detection(self):
+        self.assertTrue(is_post_soviet_scope_question("полусладкие вина постсоветских стран"))
+        self.assertTrue(is_post_soviet_scope_question("а как насчет крымских десертных вин?"))
+        self.assertTrue(is_post_soviet_scope_question("вина Средней Азии"))
+        self.assertFalse(is_post_soviet_scope_question("полусладкое средней цены"))
+        self.assertFalse(is_post_soviet_scope_question("какие десертные вина Франции"))
+
+    def test_post_soviet_recommendations_prioritize_russia(self):
+        base_dir = Path(__file__).parents[1] / "knowledge_base"
+        chunks = load_knowledge_chunks(base_dir, chunk_size=500, chunk_overlap=100)
+        assistant = WineRAGAssistant(bm25_index=BM25Index(chunks), chat_client=FakeChatClient())
+
+        prompt = assistant.build_user_prompt(
+            "Какие полусладкие вина можно предложить из постсоветских стран?",
+            "Хванчкара, Киндзмараули, Массандра, кагор, объемы производства стран бывшего СССР.",
+        )
+
+        self.assertIn("ПОДСКАЗКА ПО РЕГИОНАМ", prompt)
+        self.assertIn("1) Россия", prompt)
+        self.assertIn("Грузия и Азербайджан", prompt)
+        self.assertIn("Средняя Азия", prompt)
+        self.assertIn("около 1%", prompt)
+        self.assertIn("не поставляются", prompt)
+        self.assertIn("не включай их в рекомендации", prompt)
+
+    def test_non_post_soviet_question_has_no_region_priority_hint(self):
+        base_dir = Path(__file__).parents[1] / "knowledge_base"
+        chunks = load_knowledge_chunks(base_dir, chunk_size=500, chunk_overlap=100)
+        assistant = WineRAGAssistant(bm25_index=BM25Index(chunks), chat_client=FakeChatClient())
+
+        prompt = assistant.build_user_prompt(
+            "что предложишь на десерт",
+            "Sauternes — десертное вино из Бордо.",
+        )
+
+        self.assertNotIn("ПОДСКАЗКА ПО РЕГИОНАМ", prompt)
 
     def test_more_examples_repair_preserves_explicit_region(self):
         question = "а какие еще есть примеры полусладких вин постсоветских стран"
