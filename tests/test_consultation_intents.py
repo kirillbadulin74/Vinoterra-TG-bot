@@ -8,6 +8,7 @@ from src.rag import (
     build_retrieval_query,
     filter_consultation_results,
     is_broad_consultation_question,
+    is_correction_question,
     is_more_examples_question,
     is_out_of_domain_question,
     repair_correction_question,
@@ -18,8 +19,9 @@ from src.retrieval import BM25Index, SearchResult
 
 
 class FakeChatClient:
-    def __init__(self):
+    def __init__(self, responses: list[str] | None = None):
         self.prompts = []
+        self.responses = responses if responses is not None else ["Ответ-заглушка"]
 
     @property
     def chat(self):
@@ -27,8 +29,9 @@ class FakeChatClient:
 
     def create(self, **kwargs):
         self.prompts.append(kwargs["messages"][-1]["content"])
+        content = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="Ответ-заглушка"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
         )
 
 
@@ -73,6 +76,40 @@ class ConsultationIntentTests(unittest.TestCase):
         self.assertIn("сорта винограда", repaired)
         self.assertNotIn("Казахстан", repaired)
         self.assertNotIn("Кыргызстан", repaired)
+
+    def test_scoped_how_about_question_keeps_explicit_region(self):
+        question = "А как насчет полусладких вин постсоветских стран?"
+
+        self.assertFalse(is_correction_question(question))
+        self.assertIsNone(repair_correction_question(question))
+        self.assertFalse(is_broad_consultation_question(question))
+
+        query = build_retrieval_query(question)
+        self.assertIn("Хванчкара", query)
+        self.assertIn("Киндзмараули", query)
+        self.assertNotIn("Sauternes", query)
+
+    def test_crimean_how_about_question_keeps_explicit_region(self):
+        question = "а как насчет крымских десертных вин?"
+
+        self.assertFalse(is_correction_question(question))
+        self.assertFalse(is_broad_consultation_question(question))
+
+        query = build_retrieval_query(question)
+        self.assertIn("Массандра", query)
+        self.assertIn("кагор", query)
+        self.assertNotIn("Sauternes", query)
+
+    def test_more_examples_repair_preserves_explicit_region(self):
+        question = "а какие еще есть примеры полусладких вин постсоветских стран"
+        history = [("предыдущий вопрос", "Sauternes, Tokaji и Icewine")]
+
+        repaired = repair_more_examples_question(question, history)
+
+        self.assertIsNotNone(repaired)
+        self.assertIn("постсоветских стран", repaired)
+        self.assertIn("3–5 новых примеров", repaired)
+        self.assertNotIn("разных винодельческих регионов мира", repaired)
 
     def test_broad_consultation_ignores_narrow_regional_sources(self):
         def result(source_file: str, chunk_id: str) -> SearchResult:
@@ -153,14 +190,43 @@ class ConsultationIntentTests(unittest.TestCase):
         self.assertIn("не повторяй", client.prompts[-1].lower())
         self.assertIn("Vin Santo", answer.context)
 
+    def test_real_knowledge_base_honors_post_soviet_scope(self):
+        base_dir = Path(__file__).parents[1] / "knowledge_base"
+        chunks = load_knowledge_chunks(base_dir, chunk_size=500, chunk_overlap=100)
+        client = FakeChatClient(
+            responses=[
+                "Какие полусладкие вина можно предложить из постсоветских стран?",
+                "Ответ-заглушка",
+            ]
+        )
+        assistant = WineRAGAssistant(bm25_index=BM25Index(chunks), chat_client=client)
+
+        answer = assistant.answer(
+            "А как насчет полусладких вин постсоветских стран?",
+            mode="bm25",
+            top_k=8,
+            history=[("что предложишь на десерт", "Sauternes, Tokaji и Icewine")],
+        )
+
+        self.assertIn("постсоветск", answer.question)
+        sources = {item.source_file for item in answer.results}
+        self.assertIn("wine_russia_and_ussr.md", sources)
+        self.assertIn("Хванчкара", answer.context)
+        prompt = client.prompts[-1]
+        self.assertIn("постсоветск", prompt)
+        self.assertNotIn("ДИАЛОГОВАЯ ПОПРАВКА", prompt)
+
     def test_temperature_ranges_are_repaired_after_llm_formatting(self):
         text = (
             "Игристое подается при температуре 68 C. "
-            "Белое — 810 C, легкое красное — 1416 C."
+            "Белое — 810 C, крепленое — 1012 C, портвейн — 1214 C, "
+            "легкое красное — 1416 C."
         )
         repaired = repair_temperature_ranges(text)
         self.assertIn("6–8 °C", repaired)
         self.assertIn("8–10 °C", repaired)
+        self.assertIn("10–12 °C", repaired)
+        self.assertIn("12–14 °C", repaired)
         self.assertIn("14–16 °C", repaired)
         self.assertNotIn("68 C", repaired)
         self.assertNotIn("810 C", repaired)

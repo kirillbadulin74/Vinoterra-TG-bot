@@ -173,6 +173,19 @@ WORLD_GEOGRAPHY_MARKERS = (
     "кита",
     "япон",
     "инд",
+    "постсовет",
+    "снг",
+    "ссср",
+    "советск",
+    "закавказ",
+    "средней азии",
+    "средняя азия",
+    "среднеазиат",
+    "крым",
+    "беларус",
+    "белорус",
+    "азербайдж",
+    "молдав",
 )
 
 
@@ -952,7 +965,18 @@ class WineRAGAssistant:
                     question = more_examples_question
                     dialogue_note = build_more_examples_dialogue_note(history)
                 else:
-                    question = self.condense_question(question, history)
+                    condensed = self.condense_question(question, history)
+                    # Страховка: явная география из реплики пользователя не
+                    # должна теряться при LLM-конденсации follow-up.
+                    original_normalized = question.lower().replace("ё", "е")
+                    condensed_normalized = condensed.lower().replace("ё", "е")
+                    if any(
+                        term in original_normalized for term in WORLD_GEOGRAPHY_MARKERS
+                    ) and not any(
+                        term in condensed_normalized for term in WORLD_GEOGRAPHY_MARKERS
+                    ):
+                        condensed = question
+                    question = condensed
                     if is_correction_question(original_question):
                         dialogue_note = (
                             "\n\nДИАЛОГОВАЯ ПОПРАВКА: пользователь считает предыдущий ответ "
@@ -1264,7 +1288,16 @@ def is_out_of_domain_question(
 def is_correction_question(question: str) -> bool:
     """Распознаёт реплику, которая отбрасывает ошибочную ветку диалога."""
     normalized = question.lower().replace("ё", "е")
-    return any(term in normalized for term in CORRECTION_TERMS)
+    if not any(term in normalized for term in CORRECTION_TERMS):
+        return False
+    # «А как насчет …» с явной географией — не жалоба на ошибку, а конкретный
+    # follow-up про регион. Такая реплика самодостаточна: не переписываем её
+    # общим вопросом и не добавляем извинение за ошибку.
+    if "как насчет" in normalized and any(
+        term in normalized for term in WORLD_GEOGRAPHY_MARKERS
+    ):
+        return False
+    return True
 
 
 def is_more_examples_question(question: str) -> bool:
@@ -1300,22 +1333,30 @@ def repair_more_examples_question(
         return None
 
     normalized = question.lower().replace("ё", "е")
-    has_semisweet = "полуслад" in normalized
-    has_dessert = any(term in normalized for term in ("десерт", "сладк"))
-    if has_semisweet and has_dessert:
-        target = "полусладкие и десертные вина"
-    elif has_semisweet:
-        target = "полусладкие вина"
-    elif has_dessert:
-        target = "десертные вина"
+    if any(term in normalized for term in WORLD_GEOGRAPHY_MARKERS):
+        # Регион уже задан явно: сохраняем его, а не подменяем «разными
+        # регионами мира».
+        query = (
+            f"{question.strip()} Дай 3–5 новых примеров, не повторяй уже "
+            "названные варианты; укажи стиль, регион или страну, сочетания "
+            "и подтверждённую температуру подачи."
+        )
     else:
-        target = "винные стили"
-
-    query = (
-        f"Какие ещё {target} можно предложить? Дай 3–5 новых примеров из разных "
-        "винодельческих регионов мира, не повторяй уже названные варианты; укажи "
-        "стиль, регион или страну, сочетания и подтверждённую температуру подачи."
-    )
+        has_semisweet = "полуслад" in normalized
+        has_dessert = any(term in normalized for term in ("десерт", "сладк"))
+        if has_semisweet and has_dessert:
+            target = "полусладкие и десертные вина"
+        elif has_semisweet:
+            target = "полусладкие вина"
+        elif has_dessert:
+            target = "десертные вина"
+        else:
+            target = "винные стили"
+        query = (
+            f"Какие ещё {target} можно предложить? Дай 3–5 новых примеров из разных "
+            "винодельческих регионов мира, не повторяй уже названные варианты; укажи "
+            "стиль, регион или страну, сочетания и подтверждённую температуру подачи."
+        )
     excerpts = previous_answer_excerpts(history or [])
     if excerpts:
         query += " Уже названные варианты перечислены в истории диалога — не повторяй их."
@@ -1367,11 +1408,29 @@ def build_retrieval_query(question: str) -> str:
     """
     normalized = question.lower().replace("ё", "е")
     additions: list[str] = []
+    has_geography = any(term in normalized for term in WORLD_GEOGRAPHY_MARKERS)
     has_dessert_food = any(term in normalized for term in DESSERT_FOOD_TERMS) and any(
         term in normalized
         for term in PAIRING_TERMS + RECOMMENDATION_TERMS + ("вино", "виноград")
     )
-    if any(term in normalized for term in DESSERT_TERMS) or has_dessert_food:
+    has_dessert_terms = (
+        any(term in normalized for term in DESSERT_TERMS) or has_dessert_food
+    )
+    if has_dessert_terms and has_geography and any(
+        term in normalized for term in POST_SOVIET_MARKERS
+    ):
+        # Постсоветский скоуп: расширяем запрос профильными примерами из
+        # wine_russia_and_ussr.md вместо мировых десертных стилей.
+        additions.extend(
+            [
+                "полусладкие и десертные вина",
+                "Хванчкара Киндзмараули Твиши Усахелаури",
+                "Массандра Мускат Красного Камня Чёрный Доктор",
+                "кагор портвейн херес мадера",
+                "температура подачи",
+            ]
+        )
+    elif has_dessert_terms:
         additions.extend(
             [
                 "десертные вина",
