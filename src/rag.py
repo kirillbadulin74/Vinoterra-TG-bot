@@ -111,6 +111,30 @@ CORRECTION_TERMS = (
     "как насчёт",
 )
 
+# Follow-up, в котором пользователь просит продолжить список, а не повторять
+# уже названные варианты. Не добавляем «ещё» в CORRECTION_TERMS: это слово
+# встречается и в обычных вопросах («кто ещё пил это вино?»), где нужна
+# конденсация с сохранением исходного смысла, а не специальная ветка списка.
+MORE_EXAMPLES_TERMS = (
+    "еще",
+    "друг",
+    "дополнител",
+    "помимо",
+    "кроме",
+    "иные",
+    "новые",
+)
+
+EXAMPLE_REQUEST_TERMS = (
+    "пример",
+    "вариант",
+    "вино",
+    "стиль",
+    "полуслад",
+    "десерт",
+    "сладк",
+)
+
 RECIPE_TERMS = ("рецепт", "приготов", "испеч", "свар", "пожар", "как сделать")
 
 GENERIC_CONSULTATION_SOURCES = frozenset({
@@ -253,11 +277,17 @@ SYSTEM_INSTRUCTION = (
     "сбой и начни заново с последнего намерения пользователя. Не повторяй страны, "
     "сорта или регионы, которые появились только в ошибочном ответе, и не выдавай их "
     "за рамку вопроса.\n"
-    "12. Не ссылайся в ответе на внутреннюю структуру контекста: номера фрагментов "
+    "12. Если пользователь просит другие, ещё или дополнительные примеры, не повторяй "
+    "названия, которые уже были перечислены в предыдущих ответах. Дай 3–5 новых уместных "
+    "стилей или категорий из текущего контекста; если новых вариантов в контексте мало, "
+    "честно назови только доступные и не маскируй повторы под новые примеры.\n"
+    "13. Температуру подачи записывай с диапазоном и единицами, например `6–8 °C` или "
+    "`8–10 °C`. Не склеивай границы диапазона в `68`, `810` или `1416` и не убирай знак `°`.\n"
+    "14. Не ссылайся в ответе на внутреннюю структуру контекста: номера фрагментов "
     "('Фрагмент 3', 'фрагменты 1, 2, 5'), имена файлов-источников и пути разделов "
     "пользователь не видит — такие ссылки для него бессмысленны. Излагай факты "
     "напрямую, без указания, из какого фрагмента они взяты.\n"
-    "13. Форматируй ответ в Markdown."
+    "15. Форматируй ответ в Markdown."
 )
 
 OUT_OF_DOMAIN_ANSWER = (
@@ -570,6 +600,42 @@ class RAGAnswer:
         return [format_result_line(result) for result in self.results]
 
 
+def repair_temperature_ranges(text: str) -> str:
+    """Исправляет склеенные моделью диапазоны вроде «810 C» → «8–10 °C».
+
+    Иногда LLM теряет тире и знак градуса при копировании диапазонов из Markdown.
+    Исправление ограничено числами, похожими на винные температуры, и срабатывает
+    только рядом с температурной лексикой, чтобы не менять годы и прочие числа.
+    """
+    malformed = re.compile(r"(?<![\d–—-])(\d{2,4})\s*°?\s*[CcСс](?![A-Za-zА-Яа-я])")
+    temperature_context = re.compile(r"температур|подач|градус|охлажд", re.IGNORECASE)
+
+    def replace(match: re.Match[str]) -> str:
+        prefix = text[max(0, match.start() - 90) : match.start()]
+        if not temperature_context.search(prefix):
+            return match.group(0)
+
+        digits = match.group(1)
+        candidates: list[tuple[int, int, int]] = []
+        for split in range(1, len(digits)):
+            start = int(digits[:split])
+            end = int(digits[split:])
+            if 1 <= start <= 30 and 1 <= end <= 30 and end > start and end - start <= 12:
+                candidates.append((split, start, end))
+        if not candidates:
+            return match.group(0)
+
+        # Для 810/1416 это единственный реалистичный разбор; при неоднозначности
+        # предпочитаем одинаковую разрядность границ диапазона.
+        _split, start, end = max(
+            candidates,
+            key=lambda item: (len(digits) % 2 == 0 and item[0] == len(digits) // 2, item[0]),
+        )
+        return f"{start}–{end} °C"
+
+    return malformed.sub(replace, text)
+
+
 class WineRAGAssistant:
     def __init__(
         self,
@@ -836,6 +902,18 @@ class WineRAGAssistant:
                 "обычно. Отказывай только если в контексте нет ничего "
                 "релевантного про X."
             )
+        elif re.search(
+            r"сорт.*(?:или|либо).*происхожд|происхожд.*(?:или|либо).*сорт",
+            normalized,
+        ):
+            hint = (
+                "\n\nПОДСКАЗКА ПО ФОРМЕ ВОПРОСА: пользователь уточняет разницу между "
+                "сортом винограда, стилем вина и местом происхождения. Не отвечай "
+                "«я предлагаю сорт вина». Скажи прямо: сорт — это виноград; стиль "
+                "(например, Sauternes, Tokaji или Icewine) — категория/тип вина; "
+                "Франция, Венгрия и другие страны или регионы — происхождение. "
+                "Разбери именно названия, которые есть в текущем контексте."
+            )
         return (
             "РЕЛЕВАНТНЫЕ ВЫДЕРЖКИ ИЗ БАЗЫ ЗНАНИЙ:\n"
             f"{context}\n\n"
@@ -866,14 +944,21 @@ class WineRAGAssistant:
                     "ответ. Начни с короткого извинения за уход в сторону, не повторяй "
                     "случайно названные там страны и отвечай на восстановленный вопрос."
                 )
+                if any(term in original_question.lower().replace("ё", "е") for term in DESSERT_TERMS):
+                    dialogue_note += build_more_examples_dialogue_note(history)
             else:
-                question = self.condense_question(question, history)
-                if is_correction_question(original_question):
-                    dialogue_note = (
-                        "\n\nДИАЛОГОВАЯ ПОПРАВКА: пользователь считает предыдущий ответ "
-                        "нерелевантным. Если это так, коротко извинись и следуй последней "
-                        "формулировке, не расширяя её за счёт ошибочной географии."
-                    )
+                more_examples_question = repair_more_examples_question(question, history)
+                if more_examples_question:
+                    question = more_examples_question
+                    dialogue_note = build_more_examples_dialogue_note(history)
+                else:
+                    question = self.condense_question(question, history)
+                    if is_correction_question(original_question):
+                        dialogue_note = (
+                            "\n\nДИАЛОГОВАЯ ПОПРАВКА: пользователь считает предыдущий ответ "
+                            "нерелевантным. Если это так, коротко извинись и следуй последней "
+                            "формулировке, не расширяя её за счёт ошибочной географии."
+                        )
         # Гард OOD: жёсткий отказ — только для ПЕРВОЙ реплики. Внутри диалога
         # эллиптический follow-up («А Черчилль?») не несёт доменных маркеров,
         # а при сбое конденсации доходит до гарда как есть — отказывать нельзя:
@@ -1051,7 +1136,8 @@ class WineRAGAssistant:
                 max_tokens=self.max_answer_tokens,
                 timeout=self.timeout,
             )
-            return response.choices[0].message.content or "", "main"
+            answer_text = response.choices[0].message.content or ""
+            return repair_temperature_ranges(answer_text), "main"
         except Exception as main_exc:
             fallback_client = self._get_fallback_client()
             if fallback_client is None:
@@ -1073,7 +1159,8 @@ class WineRAGAssistant:
             except Exception as fallback_exc:
                 print(f"LLM fallback also failed: {fallback_exc}", flush=True)
                 raise main_exc
-            return response.choices[0].message.content or "", "fallback"
+            answer_text = response.choices[0].message.content or ""
+            return repair_temperature_ranges(answer_text), "fallback"
 
     def _get_chat_client(self) -> object:
         if self.chat_client is not None:
@@ -1180,6 +1267,82 @@ def is_correction_question(question: str) -> bool:
     return any(term in normalized for term in CORRECTION_TERMS)
 
 
+def is_more_examples_question(question: str) -> bool:
+    """Распознаёт просьбу продолжить список новыми винными примерами."""
+    normalized = question.lower().replace("ё", "е")
+    asks_for_more = any(term in normalized for term in MORE_EXAMPLES_TERMS)
+    asks_for_wine_examples = any(term in normalized for term in EXAMPLE_REQUEST_TERMS)
+    return asks_for_more and asks_for_wine_examples
+
+
+def previous_answer_excerpts(
+    history: Sequence[tuple[str, str]],
+    *,
+    max_answers: int = 4,
+    max_chars: int = 900,
+) -> list[str]:
+    """Возвращает короткие выдержки старых ответов для исключения повторов.
+
+    Это не источник фактов: выдержки нужны только для того, чтобы модель видела,
+    какие названия уже прозвучали в диалоге. Факты по-прежнему берутся из текущего
+    retrieval-контекста.
+    """
+    answers = [answer.strip() for _, answer in history if answer and answer.strip()]
+    return [answer[:max_chars] for answer in answers[-max_answers:]]
+
+
+def repair_more_examples_question(
+    question: str,
+    history: Sequence[tuple[str, str]] | None = None,
+) -> str | None:
+    """Строит явный запрос на новые варианты без повторения предыдущих."""
+    if not is_more_examples_question(question):
+        return None
+
+    normalized = question.lower().replace("ё", "е")
+    has_semisweet = "полуслад" in normalized
+    has_dessert = any(term in normalized for term in ("десерт", "сладк"))
+    if has_semisweet and has_dessert:
+        target = "полусладкие и десертные вина"
+    elif has_semisweet:
+        target = "полусладкие вина"
+    elif has_dessert:
+        target = "десертные вина"
+    else:
+        target = "винные стили"
+
+    query = (
+        f"Какие ещё {target} можно предложить? Дай 3–5 новых примеров из разных "
+        "винодельческих регионов мира, не повторяй уже названные варианты; укажи "
+        "стиль, регион или страну, сочетания и подтверждённую температуру подачи."
+    )
+    excerpts = previous_answer_excerpts(history or [])
+    if excerpts:
+        query += " Уже названные варианты перечислены в истории диалога — не повторяй их."
+    return query
+
+
+def build_more_examples_dialogue_note(
+    history: Sequence[tuple[str, str]],
+) -> str:
+    """Добавляет модели список уже показанных вариантов без выдачи его за факты."""
+    excerpts = previous_answer_excerpts(history)
+    if not excerpts:
+        return (
+            "\n\nДИАЛОГОВАЯ ПОДСКАЗКА: пользователь просит новые примеры. "
+            "Не повторяй варианты из предыдущего ответа."
+        )
+
+    previous = "\n\n---\n\n".join(excerpts)
+    return (
+        "\n\nДИАЛОГОВАЯ ПОДСКАЗКА: пользователь просит другие примеры, а не повтор "
+        "списка. Ниже приведены только выдержки прежних ответов для определения "
+        "названий, которые нужно исключить; это НЕ источник новых фактов. Не повторяй "
+        "эти варианты и используй только сведения из раздела «РЕЛЕВАНТНЫЕ ВЫДЕРЖКИ»:\n"
+        f"{previous}"
+    )
+
+
 def is_broad_consultation_question(question: str) -> bool:
     """True для общих рекомендаций без явно заданной страны/региона."""
     normalized = question.lower().replace("ё", "е")
@@ -1217,6 +1380,20 @@ def build_retrieval_query(question: str) -> str:
                 "шоколад фруктовые ореховые десерты",
                 "Sauternes Tokaji Muscat Port Madeira Asti",
                 "температура подачи",
+            ]
+        )
+    if is_more_examples_question(question):
+        # Для запроса «что-нибудь ещё» одних общих терминов недостаточно:
+        # BM25 иначе снова поднимает тот же короткий список Sauternes/Tokaji.
+        # Добавляем в поисковый запрос другие категории, уже описанные в базе.
+        additions.extend(
+            [
+                "новые примеры без повторов",
+                "Vin Santo Pedro Ximénez PX Recioto",
+                "Moscato d'Asti Passito di Pantelleria Marsala Málaga",
+                "Banyuls Maury Malvasia",
+                "Spätlese Auslese Beerenauslese Trockenbeerenauslese",
+                "Rutherglen Muscat Topaque",
             ]
         )
     if any(term in normalized for term in RECOMMENDATION_TERMS):
@@ -1264,8 +1441,9 @@ def repair_correction_question(question: str) -> str | None:
     if has_sweetness:
         return (
             "Какие ещё полусладкие и десертные вина можно предложить из разных "
-            "винодельческих регионов мира? Укажи стили, примеры сочетаний и "
-            "температуру подачи."
+            "винодельческих регионов мира? Дай 3–5 новых примеров и не повторяй "
+            "варианты из предыдущих ответов. Укажи стили, примеры сочетаний и "
+            "подтверждённую температуру подачи."
         )
     return None
 

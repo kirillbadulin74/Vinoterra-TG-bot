@@ -8,8 +8,11 @@ from src.rag import (
     build_retrieval_query,
     filter_consultation_results,
     is_broad_consultation_question,
+    is_more_examples_question,
     is_out_of_domain_question,
     repair_correction_question,
+    repair_more_examples_question,
+    repair_temperature_ranges,
 )
 from src.retrieval import BM25Index, SearchResult
 
@@ -47,6 +50,20 @@ class ConsultationIntentTests(unittest.TestCase):
         self.assertIn("десертные вина", query)
         self.assertIn("Sauternes Tokaji Muscat Port Madeira Asti", query)
         self.assertIn("температура подачи", query)
+
+    def test_more_examples_request_gets_new_styles_and_exclusion_rule(self):
+        question = "а какие еще есть примеры полусладких вин"
+        history = [("предыдущий вопрос", "Sauternes, Tokaji и Icewine")]
+
+        self.assertTrue(is_more_examples_question(question))
+        repaired = repair_more_examples_question(question, history)
+        self.assertIsNotNone(repaired)
+        self.assertIn("новых примеров", repaired)
+        self.assertIn("не повторяй", repaired)
+
+        query = build_retrieval_query(question)
+        self.assertIn("Vin Santo", query)
+        self.assertIn("Recioto", query)
 
     def test_correction_drops_accidental_geography(self):
         question = "а при чем тут Казахстан и Кыргызстан, я спросил о сортах вина"
@@ -115,6 +132,50 @@ class ConsultationIntentTests(unittest.TestCase):
         self.assertIn("сорта винограда", answer.question)
         self.assertNotIn("Казахстан", answer.question)
         self.assertIn("Cabernet Sauvignon", client.prompts[-1])
+
+    def test_sweetness_correction_requests_new_options_instead_of_repeating(self):
+        base_dir = Path(__file__).parents[1] / "knowledge_base"
+        chunks = load_knowledge_chunks(base_dir, chunk_size=500, chunk_overlap=100)
+        client = FakeChatClient()
+        assistant = WineRAGAssistant(bm25_index=BM25Index(chunks), chat_client=client)
+
+        answer = assistant.answer(
+            "значит ты только эти полусладкие вина можешь предложить",
+            mode="bm25",
+            top_k=8,
+            history=[
+                ("что предложишь на десерт", "Sauternes, Porto Tawny, Porto Vintage"),
+                ("а как насчет полусладких", "Sauternes, Tokaji, Icewine, поздний сбор"),
+            ],
+        )
+
+        self.assertIn("3–5 новых примеров", answer.question)
+        self.assertIn("не повторяй", client.prompts[-1].lower())
+        self.assertIn("Vin Santo", answer.context)
+
+    def test_temperature_ranges_are_repaired_after_llm_formatting(self):
+        text = (
+            "Игристое подается при температуре 68 C. "
+            "Белое — 810 C, легкое красное — 1416 C."
+        )
+        repaired = repair_temperature_ranges(text)
+        self.assertIn("6–8 °C", repaired)
+        self.assertIn("8–10 °C", repaired)
+        self.assertIn("14–16 °C", repaired)
+        self.assertNotIn("68 C", repaired)
+        self.assertNotIn("810 C", repaired)
+
+    def test_variety_or_origin_question_gets_classification_hint(self):
+        base_dir = Path(__file__).parents[1] / "knowledge_base"
+        chunks = load_knowledge_chunks(base_dir, chunk_size=500, chunk_overlap=100)
+        assistant = WineRAGAssistant(bm25_index=BM25Index(chunks), chat_client=FakeChatClient())
+
+        prompt = assistant.build_user_prompt(
+            "ты предлагаешь сорт вина или место происхождения?",
+            "Sauternes — стиль вина; Франция — происхождение; Мускат — сорт винограда.",
+        )
+        self.assertIn("сорт — это виноград", prompt)
+        self.assertIn("Не отвечай", prompt)
 
 
 if __name__ == "__main__":
