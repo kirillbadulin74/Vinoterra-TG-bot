@@ -101,6 +101,20 @@ class ConsultationIntentTests(unittest.TestCase):
         self.assertIn("кагор", query)
         self.assertNotIn("Sauternes", query)
 
+    def test_russian_region_how_about_questions_keep_explicit_region(self):
+        questions = (
+            "а как насчет дагестанских десертных вин?",
+            "а как насчет кубанских полусладких вин?",
+            "а как насчет ставропольских десертных вин?",
+            "а как насчет донских ликерных вин?",
+        )
+
+        for question in questions:
+            self.assertFalse(is_correction_question(question), question)
+            self.assertFalse(is_broad_consultation_question(question), question)
+            query = build_retrieval_query(question)
+            self.assertNotIn("Sauternes", query, question)
+
     def test_post_soviet_scope_detection(self):
         self.assertTrue(is_post_soviet_scope_question("полусладкие вина постсоветских стран"))
         self.assertTrue(is_post_soviet_scope_question("а как насчет крымских десертных вин?"))
@@ -252,6 +266,33 @@ class ConsultationIntentTests(unittest.TestCase):
         self.assertIn("Хванчкара", answer.context)
         prompt = client.prompts[-1]
         self.assertIn("постсоветск", prompt)
+        self.assertNotIn("ДИАЛОГОВАЯ ПОПРАВКА", prompt)
+
+    def test_real_knowledge_base_honors_dagestan_scope(self):
+        base_dir = Path(__file__).parents[1] / "knowledge_base"
+        chunks = load_knowledge_chunks(base_dir, chunk_size=500, chunk_overlap=100)
+        client = FakeChatClient(
+            responses=[
+                "Какие десертные вина можно предложить из Дагестана?",
+                "Ответ-заглушка",
+            ]
+        )
+        assistant = WineRAGAssistant(bm25_index=BM25Index(chunks), chat_client=client)
+
+        answer = assistant.answer(
+            "а как насчет дагестанских десертных вин?",
+            mode="bm25",
+            top_k=8,
+            history=[
+                ("а как насчет крымских десертных вин?", "Массандра, портвейн, мадера")
+            ],
+        )
+
+        sources = {item.source_file for item in answer.results}
+        self.assertIn("wine_russia_and_ussr.md", sources)
+        self.assertIn("Дагестан", answer.context)
+        prompt = client.prompts[-1]
+        self.assertIn("Дагестан", prompt)
         self.assertNotIn("ДИАЛОГОВАЯ ПОПРАВКА", prompt)
 
     def test_temperature_ranges_are_repaired_after_llm_formatting(self):
