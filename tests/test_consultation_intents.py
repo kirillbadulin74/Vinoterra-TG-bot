@@ -97,9 +97,41 @@ class ConsultationIntentTests(unittest.TestCase):
         self.assertFalse(is_broad_consultation_question(question))
 
         query = build_retrieval_query(question)
-        self.assertIn("Массандра", query)
-        self.assertIn("кагор", query)
+        self.assertIn("Крым", query)
         self.assertNotIn("Sauternes", query)
+        self.assertNotIn("Массандра", query)
+
+    def test_specific_post_soviet_regions_get_canonical_names(self):
+        cases = {
+            "А как насчет десертных вин Ставрополья?": "Ставрополье",
+            "А как насчет Долины Дона?": "Долина Дона",
+            "Есть ли десертные вина в Долине Терека?": "Долина Терека",
+            "А что скажешь о нижневолжских десертных винах?": "Нижняя Волга",
+            "какие десертные вина есть в России?": "Россия",
+        }
+
+        for question, region in cases.items():
+            query = build_retrieval_query(question)
+            self.assertIn(region, query, question)
+            self.assertNotIn("Sauternes", query, question)
+            self.assertNotIn("Массандра", query, question)
+
+    def test_umbrella_post_soviet_query_still_gets_wine_names(self):
+        query = build_retrieval_query("А как насчет полусладких вин постсоветских стран?")
+
+        self.assertIn("Хванчкара", query)
+        self.assertIn("Массандра", query)
+
+    def test_don_and_terek_valley_questions_are_recognized(self):
+        questions = (
+            "А как насчет Долины Дона?",
+            "Но в Долине Дона точно делают кагор",
+            "Есть ли десертные вина в Долине Терека",
+        )
+
+        for question in questions:
+            self.assertFalse(is_correction_question(question), question)
+            self.assertFalse(is_broad_consultation_question(question), question)
 
     def test_russian_region_how_about_questions_keep_explicit_region(self):
         questions = (
@@ -139,6 +171,18 @@ class ConsultationIntentTests(unittest.TestCase):
         self.assertIn("около 1%", prompt)
         self.assertIn("не поставляются", prompt)
         self.assertIn("не включай их в рекомендации", prompt)
+
+    def test_specific_region_hint_forbids_neighbor_wines(self):
+        base_dir = Path(__file__).parents[1] / "knowledge_base"
+        chunks = load_knowledge_chunks(base_dir, chunk_size=500, chunk_overlap=100)
+        assistant = WineRAGAssistant(bm25_index=BM25Index(chunks), chat_client=FakeChatClient())
+
+        prompt = assistant.build_user_prompt(
+            "Но в Долине Дона точно делают кагор",
+            "Долина Дона: автохтонные ликёрные вина из Красностопа. Кубань: кагоры.",
+        )
+
+        self.assertIn("не приписывай ему вина соседних регионов", prompt)
 
     def test_non_post_soviet_question_has_no_region_priority_hint(self):
         base_dir = Path(__file__).parents[1] / "knowledge_base"
@@ -293,6 +337,59 @@ class ConsultationIntentTests(unittest.TestCase):
         self.assertIn("Дагестан", answer.context)
         prompt = client.prompts[-1]
         self.assertIn("Дагестан", prompt)
+        self.assertNotIn("ДИАЛОГОВАЯ ПОПРАВКА", prompt)
+
+    def test_real_knowledge_base_honors_stavropol_follow_up(self):
+        base_dir = Path(__file__).parents[1] / "knowledge_base"
+        chunks = load_knowledge_chunks(base_dir, chunk_size=500, chunk_overlap=100)
+        client = FakeChatClient(
+            responses=[
+                "А как насчет десертных вин Ставрополья?",
+                "Ответ-заглушка",
+            ]
+        )
+        assistant = WineRAGAssistant(bm25_index=BM25Index(chunks), chat_client=client)
+
+        answer = assistant.answer(
+            "А как насчет Ставрополья?",
+            mode="bm25",
+            top_k=8,
+            history=[
+                ("какие полусладкие и десертные вина есть на Кубани", "Кагор Кубанский, Мускат Кубанский")
+            ],
+        )
+
+        self.assertIn("Ставрополь", answer.context)
+        self.assertIn("Прасковейск", answer.context)
+        prompt = client.prompts[-1]
+        self.assertIn("Ставрополь", prompt)
+        self.assertNotIn("ДИАЛОГОВАЯ ПОПРАВКА", prompt)
+
+    def test_real_knowledge_base_honors_don_valley_follow_up(self):
+        base_dir = Path(__file__).parents[1] / "knowledge_base"
+        chunks = load_knowledge_chunks(base_dir, chunk_size=500, chunk_overlap=100)
+        client = FakeChatClient(
+            responses=[
+                "А как насчет десертных вин Долины Дона?",
+                "Ответ-заглушка",
+            ]
+        )
+        assistant = WineRAGAssistant(bm25_index=BM25Index(chunks), chat_client=client)
+
+        answer = assistant.answer(
+            "А как еасчет Долины Дона?",
+            mode="bm25",
+            top_k=8,
+            history=[
+                ("какие полусладкие и десертные вина есть на Кубани", "Кагор Кубанский, Мускат Кубанский")
+            ],
+        )
+
+        sources = {item.source_file for item in answer.results}
+        self.assertIn("wine_russia_and_ussr.md", sources)
+        self.assertIn("Долина Дона", answer.context)
+        prompt = client.prompts[-1]
+        self.assertIn("Долина Дона", prompt)
         self.assertNotIn("ДИАЛОГОВАЯ ПОПРАВКА", prompt)
 
     def test_temperature_ranges_are_repaired_after_llm_formatting(self):
