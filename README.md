@@ -1,5 +1,7 @@
 # VINOTERRA — Нейро-сомелье
 
+[![Tests](https://github.com/kirillbadulin74/Vinoterra-TG-bot/actions/workflows/tests.yml/badge.svg)](https://github.com/kirillbadulin74/Vinoterra-TG-bot/actions/workflows/tests.yml)
+
 RAG-ассистент по вину и виноделию: Telegram-бот, который отвечает на вопросы,
 опираясь на собственную базу знаний, а не на «память» языковой модели. Гибридный
 поиск (BM25 + векторный, reciprocal rank fusion), генерация через OpenAI с
@@ -37,7 +39,7 @@ src/telegram_bot.py        Telegram-интерфейс поверх ядра
 src/feedback_store.py      SQLite-лог вопросов и оценок
 
 knowledge_base/            база знаний (Markdown)
-vector_index/              кеш эмбеддингов (готов к использованию)
+vector_index/              кеш эмбеддингов (в Git не хранится — собирается локально)
 ```
 
 ## Запуск
@@ -51,8 +53,17 @@ pip install -r requirements.txt
 ```
 
 Скопируйте `.env.example` в `.env` и заполните ключи (`OPENAI_API_KEY`,
-`TELEGRAM_BOT_TOKEN`). Кеш эмбеддингов уже лежит в `vector_index/` — пересобирать
-не нужно.
+`TELEGRAM_BOT_TOKEN`).
+
+Кеш эмбеддингов `vector_index/` — производный артефакт, в Git он не хранится.
+Соберите его один раз при первом запуске и после правок базы знаний:
+
+```bash
+python build_vector_index.py
+```
+
+Без `OPENAI_API_KEY` кеш собрать нельзя, но и без него есть что запустить —
+офлайн-режим `--mode bm25` и тесты работают без обращений к OpenAI.
 
 ```bash
 python run_telegram_bot.py
@@ -104,3 +115,62 @@ Python 3.12, OpenAI API (генерация + эмбеддинги), NumPy (ве
 Telegram Bot API через стандартную библиотеку (без сторонних фреймворков),
 SQLite (фидбэк). Внешних RAG-фреймворков нет — поиск, слияние и чанкинг написаны
 в проекте.
+
+## Тестирование
+
+Тесты запускаются без Telegram-токена и без обращений к OpenAI:
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile src/*.py
+```
+
+Набор проверяет доменный гард, follow-up и исправления пользователя, BM25/RRF,
+региональный retrieval, fallback-поведение и форматирование температур.
+
+## Деплой
+
+Для локального запуска достаточно команд из раздела «Запуск». Production
+развёртывание на Linux описано в [DEPLOY.md](DEPLOY.md): там приведены systemd,
+переменные окружения, проверка `/api/health` и безопасный перезапуск одного
+процесса Telegram-бота.
+
+## Участие в проекте
+
+Перед pull request прочитайте [CONTRIBUTING.md](CONTRIBUTING.md), добавьте
+регрессионный тест для исправления и выполните локальные compile/unittest-команды.
+
+## FAQ
+
+**Можно ли искать без OpenAI?** Да, `--mode bm25` использует локальный поиск;
+генерация ответа всё равно требует настроенного LLM-провайдера.
+
+**Нужен ли Telegram-токен для тестов?** Нет, тесты используют fake-клиент.
+
+**Где хранится обратная связь?** В локальном SQLite-файле каталога `feedback/`;
+этот каталог исключён из Git.
+
+## Команда
+
+Проект поддерживает Кирилл Бадулин (`kirillbadulin74`). Изменения принимаются
+через pull request.
+
+## Источники и ссылки
+
+- `knowledge_base/*.md` — авторская база знаний проекта;
+- [OpenAI API documentation](https://platform.openai.com/docs) — генерация и embeddings;
+- [Telegram Bot API](https://core.telegram.org/bots/api) — транспорт сообщений;
+- [VINOTERRA web-проект](https://github.com/kirillbadulin74/Vino-terra-site) —
+  веб-транспорт того же RAG-ядра.
+
+## Roadmap
+
+- расширять покрытие реальных follow-up сценариев;
+- добавить отдельные smoke-тесты для feedback store и деградации провайдеров;
+- оценить cross-encoder reranking после измерения его стоимости и выигрыша.
+
+## Лицензия
+
+Код распространяется по лицензии [MIT](LICENSE). Файлы базы знаний и изображения
+включены в репозиторий как часть проекта; при переиспользовании проверяйте права
+на внешние торговые марки и иллюстрации.

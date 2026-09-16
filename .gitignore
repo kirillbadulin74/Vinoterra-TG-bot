@@ -20,3 +20,13 @@ feedback/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Локальные артефакты
+*.log
+*.tmp
+*.zip
+*.tar.gz
+
+# Производный кеш эмбеддингов — собирается локально и на сервере
+# (python build_vector_index.py), в Git не хранится.
+vector_index/
